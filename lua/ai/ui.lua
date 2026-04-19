@@ -488,13 +488,17 @@ local function setup_highlights()
 end
 
 -- ── Buffer / window helpers ───────────────────────────────────────────────
-local function make_buf(name, mod)
+-- Sidebar buffers need a stable filetype so editor integrations can opt out.
+local function make_buf(name, mod, ft)
   local buf = vim.api.nvim_create_buf(false, true)
   pcall(vim.api.nvim_buf_set_name, buf, name)
   vim.api.nvim_buf_set_option(buf, 'buftype',   'nofile')
   vim.api.nvim_buf_set_option(buf, 'swapfile',  false)
   vim.api.nvim_buf_set_option(buf, 'buflisted', false)
   vim.api.nvim_buf_set_option(buf, 'bufhidden', 'wipe')
+  if ft then
+    vim.api.nvim_buf_set_option(buf, 'filetype', ft)
+  end
   if mod ~= nil then
     vim.api.nvim_buf_set_option(buf, 'modifiable', mod)
   end
@@ -6439,7 +6443,7 @@ local function open_sidebar()
   local w = math.min(W, vim.o.columns - 24)
 
   -- ── 1. Chat split (right column, full height initially) ──────────────────
-  S.chat_buf = make_buf('AI:chat', false)
+  S.chat_buf = make_buf('AI:chat', false, 'AiChat')
   local ok_win, chat_win = pcall(vim.api.nvim_open_win, S.chat_buf, false, {
     split = 'right',
     width = w,
@@ -6461,7 +6465,7 @@ local function open_sidebar()
   pcall(vim.api.nvim_win_set_option, S.chat_win, 'smoothscroll', true)
 
   -- ── 2. Topbar split (above chat, fixed height) ────────────────────────────
-  S.topbar_buf = make_buf('AI:topbar', false)
+  S.topbar_buf = make_buf('AI:topbar', false, 'AiTopbar')
   S.topbar_win = vim.api.nvim_open_win(S.topbar_buf, false, {
     split  = 'above',
     win    = S.chat_win,
@@ -6474,7 +6478,7 @@ local function open_sidebar()
     'Normal:AiTopBg,NormalNC:AiTopBg,SignColumn:AiTopBg,EndOfBuffer:AiTopBg,StatusLine:AiTopBg,StatusLineNC:AiTopBg')
 
   -- ── 3. Input split (below chat, fixed height) ─────────────────────────────
-  S.input_buf = make_buf('AI:input', true)
+  S.input_buf = make_buf('AI:input', true, 'AiInput')
   S.input_win = vim.api.nvim_open_win(S.input_buf, false, {
     split  = 'below',
     win    = S.chat_win,
