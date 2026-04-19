@@ -20,11 +20,29 @@ local InlineApply  = require('ai.inline_apply')  -- per-hunk diff in editor buff
 
 -- ── Layout constants ──────────────────────────────────────────────────────
 local W        = 56
-local TOPBAR_H = 1
+local TOPBAR_H = 3
 local INPUT_H  = 6
 local MIN_COLS = W + 20
 local P        = 3              -- left/right padding inside chat area (increased for breathing room)
 local CHAT_W   = W - 2 * P     -- usable text width
+
+local ICONS = (vim.g.have_nerd_font ~= false) and {
+  dropdown  = '▾',
+  new       = '󰐕',
+  sessions  = '󱂬',
+  providers = '󰒓',
+  more      = '󰘧',
+  close     = '󰅖',
+  spark     = '✦',
+} or {
+  dropdown  = 'v',
+  new       = '+',
+  sessions  = '[S]',
+  providers = '[P]',
+  more      = '[...]',
+  close     = 'x',
+  spark     = '*',
+}
 
 -- ── Namespaces ────────────────────────────────────────────────────────────
 local NS_CHAT   = nil
@@ -358,6 +376,9 @@ local function setup_highlights()
   hl('AiTopArrow',    { bg = C.bg, fg = C.fg3 })
   hl('AiTopMeta',     { bg = C.bg, fg = C.fg3 })
   hl('AiTopIcon',     { bg = C.bg, fg = C.fg })
+  hl('AiTopAction',   { bg = C.bg, fg = C.secondary, bold = true })
+  hl('AiTopActionAlt',{ bg = C.bg, fg = C.fg3 })
+  hl('AiTopClose',    { bg = C.bg, fg = C.error, bold = true })
   hl('AiTopProvider', { bg = C.bg, fg = C.fg3 })
   hl('AiTopSep',      { bg = C.bg, fg = C.sep })
   hl('AiTopStream',   { bg = C.bg, fg = C.secondary, bold = true })
@@ -387,6 +408,10 @@ local function setup_highlights()
   hl('AiWelcomeHi',    { bg = C.bg, fg = C.fg, bold = true })
   hl('AiWelcomeTitle', { bg = C.bg, fg = C.fg3 })
   hl('AiWelcomeSub',   { bg = C.bg, fg = C.fg3 })
+  hl('AiWelcomeLabel', { bg = C.bg, fg = C.fg3, bold = true })
+  hl('AiSessionRow',   { bg = C.bg, fg = C.fg })
+  hl('AiSessionTime',  { bg = C.bg, fg = C.fg3 })
+  hl('AiSessionDot',   { bg = C.bg, fg = C.secondary, bold = true })
 
   -- Input left border (OpenCode: agent-colored ┃ on input pane)
   hl('AiInputBorder', { bg = C.bg_input, fg = C.secondary })
@@ -401,6 +426,11 @@ local function setup_highlights()
   hl('AiBarSend',    { bg = C.bg_send,  fg = C.fg, bold = true })
   hl('AiBarAgent',   { bg = C.bg_input, fg = C.secondary })
   hl('AiBarSpinner', { bg = C.bg_input, fg = C.secondary })
+  hl('AiBadgeAttach',{ bg = C.bg_input, fg = C.fg3 })
+  hl('AiBadgeChip',  { bg = C.bg_input, fg = C.secondary, bold = true })
+  hl('AiBadgeModel', { bg = C.bg_input, fg = C.fg3 })
+  hl('AiBadgeScope', { bg = C.bg_input, fg = C.info })
+  hl('AiBadgeSend',  { bg = C.bg_input, fg = C.fg, bold = true })
 
   -- Picker float (OpenCode: bg = backgroundPanel #141414, sel = primary)
   hl('AiPickerBg',       { bg = C.bg_panel, fg = C.fg })
@@ -485,6 +515,33 @@ local function setup_highlights()
   hl('AiFooterCost',  { bg = C.bg, fg = C.fg3 })
   hl('AiFooterWarn',  { bg = C.bg, fg = C.warning, bold = true })
   hl('AiFooterError', { bg = C.bg, fg = C.error,   bold = true })
+end
+
+local function rel_time(ts)
+  local delta = math.max(0, os.time() - (ts or os.time()))
+  if delta < 3600 then
+    local mins = math.max(1, math.floor(delta / 60))
+    return mins .. 'm'
+  end
+  if delta < 86400 then
+    return math.floor(delta / 3600) .. 'h'
+  end
+  if delta < 604800 then
+    return math.floor(delta / 86400) .. 'd'
+  end
+  if delta < 2592000 then
+    return math.floor(delta / 604800) .. 'w'
+  end
+  return math.floor(delta / 2592000) .. 'mo'
+end
+
+local function recent_sessions(limit)
+  local list = sessions.list()
+  local out = {}
+  for i = 1, math.min(limit or 5, #list) do
+    out[#out + 1] = list[i]
+  end
+  return out
 end
 
 -- ── Buffer / window helpers ───────────────────────────────────────────────
@@ -752,48 +809,109 @@ render_topbar = function()
   if not S.topbar_win or not win_ok(S.topbar_win) then return end
   if not S.topbar_buf or not vim.api.nvim_buf_is_valid(S.topbar_buf) then return end
 
-  local function chip(hl, text)
-    return '%#' .. hl .. '#' .. text:gsub('%%', '%%%%') .. '%*'
-  end
-
   local provider  = config.get_provider()
   local model     = config.get_model()
   local disp_m    = #model > 22 and (model:sub(1, 20) .. '…') or model
   local streaming = S.is_streaming
 
-  -- Left: title with breathing room (OpenCode: generous padding)
-  local left = chip('AiTopBg', '  ')
-    .. chip('AiTopTitle', 'PandaVim AI')
-    .. chip('AiTopBg', '  ')
+  local function fit(text, width)
+    if width <= 0 then return '' end
+    if vim.fn.strdisplaywidth(text) <= width then
+      return text .. string.rep(' ', math.max(0, width - vim.fn.strdisplaywidth(text)))
+    end
+    if width <= 1 then return string.rep(' ', width) end
+    return text:sub(1, math.max(1, width - 1)) .. '…'
+  end
 
-  -- Right: provider · model, with padding
+  local function pad_left(text, width)
+    local dw = vim.fn.strdisplaywidth(text)
+    if dw >= width then return fit(text, width) end
+    return string.rep(' ', width - dw) .. text
+  end
+
+  local actions = table.concat({
+    ICONS.new,
+    ICONS.sessions,
+    ICONS.providers,
+    ICONS.more,
+    ICONS.close,
+  }, '  ')
+
+  local left = '  Agents ' .. ICONS.dropdown
+  local row0_w = math.max(0, W - 1)
+  local row0_left_w = math.max(0, row0_w - vim.fn.strdisplaywidth(actions) - 2)
+  local line0 = fit(left, row0_left_w) .. '  ' .. actions
+
   local right = ''
   if streaming then
-    right = right .. chip('AiTopStream', '● ')
-      .. chip('AiTopBg', ' ')
+    right = right .. '● '
   end
   if S.token_last.prompt > 0 or S.token_last.completion > 0 then
     local tok_str = '↑' .. fmt_tok(S.token_last.prompt)
       .. ' ↓' .. fmt_tok(S.token_last.completion)
-    right = right .. chip('AiTopTokens', tok_str)
-      .. chip('AiTopBg', '  ')
+    right = right .. tok_str .. '  '
   end
-  right = right
-    .. chip('AiTopProvider', provider)
-    .. chip('AiTopBg', ' · ')
-    .. chip('AiTopMeta', disp_m)
-    .. chip('AiTopBg', '  ')
+  right = right .. provider .. ' · ' .. disp_m
+  local line2 = pad_left(right, row0_w)
 
-  local winbar = left .. '%=' .. right
-  pcall(vim.api.nvim_win_set_option, S.topbar_win, 'winbar', winbar)
-
-  -- Separator line in the buffer
   pcall(vim.api.nvim_buf_set_option, S.topbar_buf, 'modifiable', true)
   vim.api.nvim_buf_set_lines(S.topbar_buf, 0, -1, false,
-    { string.rep('─', W) })
+    { line0, string.rep('─', row0_w), line2 })
+  pcall(vim.api.nvim_win_set_option, S.topbar_win, 'winbar', '')
   if NS_TOPBAR then
     vim.api.nvim_buf_clear_namespace(S.topbar_buf, NS_TOPBAR, 0, -1)
-    vim.api.nvim_buf_add_highlight(S.topbar_buf, NS_TOPBAR, 'AiTopSep', 0, 0, -1)
+    vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 0, 2, {
+      end_col = math.min(#line0, 2 + #'Agents'),
+      hl_group = 'AiTopTitle',
+    })
+    vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 0, math.min(#line0, 9), {
+      end_col = math.min(#line0, 11),
+      hl_group = 'AiTopArrow',
+    })
+
+    local action_specs = {
+      { text = ICONS.new,       hl = 'AiTopAction' },
+      { text = ICONS.sessions,  hl = 'AiTopActionAlt' },
+      { text = ICONS.providers, hl = 'AiTopActionAlt' },
+      { text = ICONS.more,      hl = 'AiTopActionAlt' },
+      { text = ICONS.close,     hl = 'AiTopClose' },
+    }
+    local action_col = math.max(0, #line0 - #actions)
+    for i, spec in ipairs(action_specs) do
+      local start_col = line0:find(spec.text, action_col + 1, true)
+      if start_col then
+        vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 0, start_col - 1, {
+          end_col = start_col - 1 + #spec.text,
+          hl_group = spec.hl,
+        })
+        action_col = start_col + #spec.text
+      end
+    end
+
+    vim.api.nvim_buf_add_highlight(S.topbar_buf, NS_TOPBAR, 'AiTopSep', 1, 0, -1)
+
+    local row2 = line2
+    local model_start = row2:find(disp_m, 1, true)
+    local provider_start = row2:find(provider, 1, true)
+    if provider_start then
+      vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 2, provider_start - 1, {
+        end_col = provider_start - 1 + #provider,
+        hl_group = 'AiTopProvider',
+      })
+    end
+    if model_start then
+      vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 2, model_start - 1, {
+        end_col = model_start - 1 + #disp_m,
+        hl_group = 'AiTopMeta',
+      })
+    end
+    local stream_col = row2:find('● ', 1, true)
+    if stream_col then
+      vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 2, stream_col - 1, {
+        end_col = stream_col,
+        hl_group = 'AiTopStream',
+      })
+    end
   end
   pcall(vim.api.nvim_buf_set_option, S.topbar_buf, 'modifiable', false)
 end
@@ -2404,15 +2522,13 @@ local function setup_topbar_keymaps()
   local buf  = S.topbar_buf
   local bopt = { buffer = buf, noremap = true, silent = true }
   local e    = function(t) return vim.tbl_extend('force', bopt, t) end
-  vim.keymap.set('n', 'm', open_model_picker,    e{ desc = 'AI: model' })
-  vim.keymap.set('n', 'p', open_provider_picker, e{ desc = 'AI: provider' })
-  vim.keymap.set('n', 'k', open_command_picker,  e{ desc = 'AI: commands' })
+  vim.keymap.set('n', 'a', function() process_slash_command('/agents') end, e{ desc = 'AI: agents' })
+  vim.keymap.set('n', '+', function() process_slash_command('/new') end, e{ desc = 'AI: new chat' })
+  vim.keymap.set('n', 's', function() process_slash_command('/sessions') end, e{ desc = 'AI: sessions' })
+  vim.keymap.set('n', 'p', function() process_slash_command('/providers') end, e{ desc = 'AI: providers' })
+  vim.keymap.set('n', 'm', open_command_picker, e{ desc = 'AI: more' })
   vim.keymap.set('n', 'q', function() M.close() end, e{ desc = 'AI: close' })
-  vim.keymap.set('n', '+', function()
-    S.messages = {}
-    bset(S.chat_buf, 0, -1, {})
-    render_welcome()
-  end, e{ desc = 'AI: new chat' })
+  vim.keymap.set('n', 'x', function() M.close() end, e{ desc = 'AI: close' })
   vim.keymap.set('n', '<Tab>', function()
     if win_ok(S.input_win) then
       vim.api.nvim_set_current_win(S.input_win)
@@ -2450,19 +2566,21 @@ local function render_welcome()
     return pad_str .. string.rep(' ', lp) .. s
   end
 
-  -- Centered sparkle + greeting (OpenCode-style: clean, no chips)
+  -- Windsurf-style centered intro with recent sessions below.
   local ctr = {}
   local ctr_hl = {}
   local function cpush(s, h) table.insert(ctr, s); ctr_hl[#ctr] = h end
 
-  cpush(cpad('✦'),                              'AiSparkle')
+  cpush(cpad(ICONS.spark),                      'AiSparkle')
   cpush('',                                     'AiChatBg')
-  cpush(cpad('Hello there'),                    'AiWelcomeHi')
+  cpush(cpad('PandaVim AI'),                    'AiWelcomeHi')
   cpush('',                                     'AiChatBg')
-  cpush(cpad('Where would you like to start?'), 'AiWelcomeTitle')
+  cpush(cpad('Kick off a new session. Edit code in place.'), 'AiWelcomeTitle')
 
   -- Vertically center the block
-  local top_pad = math.max(2, math.floor((chat_h - #ctr) / 2))
+  local recents = recent_sessions(5)
+  local sessions_block_h = (#recents > 0) and (#recents + 2) or 0
+  local top_pad = math.max(2, math.floor((chat_h - #ctr - sessions_block_h) / 2))
 
   local all_lines, all_hl = {}, {}
   local function push(s, h)
@@ -2472,6 +2590,21 @@ local function render_welcome()
 
   for _ = 1, top_pad do push('', 'AiChatBg') end
   for i, l in ipairs(ctr) do push(l, ctr_hl[i]) end
+  if #recents > 0 then
+    push('', 'AiChatBg')
+    push(pad_str .. 'Recent sessions', 'AiWelcomeLabel')
+    for _, item in ipairs(recents) do
+      local title = item.title or 'Untitled'
+      if vim.fn.strdisplaywidth(title) > CHAT_W - 10 then
+        title = title:sub(1, CHAT_W - 12) .. '…'
+      end
+      local stamp = rel_time(item.updated_at)
+      local line = pad_str .. '  ○ ' .. title
+      local gap = math.max(1, CHAT_W - vim.fn.strdisplaywidth('  ○ ' .. title) - vim.fn.strdisplaywidth(stamp))
+      line = line .. string.rep(' ', gap) .. stamp
+      push(line, 'AiSessionRow')
+    end
+  end
   -- Fill remaining space
   local remaining = math.max(0, chat_h - top_pad - #ctr)
   for _ = 1, remaining do push('', 'AiChatBg') end
@@ -2482,6 +2615,23 @@ local function render_welcome()
     vim.api.nvim_buf_clear_namespace(S.chat_buf, NS_CHAT, 0, -1)
     for row, h in pairs(all_hl) do
       vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, h, row, 0, -1)
+    end
+    if #recents > 0 then
+      local first_row = top_pad + #ctr + 1
+      vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiWelcomeLabel', first_row, 0, -1)
+      for idx, item in ipairs(recents) do
+        local row = first_row + idx
+        local line = all_lines[row + 1] or ''
+        local dot_col = line:find('○', 1, true)
+        local stamp = rel_time(item.updated_at)
+        local stamp_col = line:find(stamp, 1, true)
+        if dot_col then
+          vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiSessionDot', row, dot_col - 1, dot_col)
+        end
+        if stamp_col then
+          vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiSessionTime', row, stamp_col - 1, -1)
+        end
+      end
     end
   end
   pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', false)
@@ -4238,15 +4388,8 @@ render_input_bar = function()
     return '%#' .. hl .. '#' .. text:gsub('%%', '%%%%') .. '%*'
   end
 
-  -- Left: agent (colored) · model · provider — with padding
-  local left = chip('AiBarBg', '  ')
-    .. chip('AiBarAgent', agent_name)
-    .. chip('AiBarBg', '  ')
-    .. chip('AiBarModel', short_m)
-    .. chip('AiBarBg', ' · ')
-    .. chip('AiBarModel', provider)
-
-  -- Right: spinner + esc during streaming, or send arrow
+  -- Keep the winbar mostly empty and push Windsurf-style controls into a
+  -- virtual footer line inside the input buffer.
   local right
   if streaming then
     local frame = SPINNER_FRAMES[S.spinner_frame] or '⣾'
@@ -4261,7 +4404,24 @@ render_input_bar = function()
       .. chip('AiBarBg', '  ')
   end
 
-  pcall(vim.api.nvim_win_set_option, S.input_win, 'winbar', left .. '%=' .. right)
+  pcall(vim.api.nvim_win_set_option, S.input_win, 'winbar', chip('AiBarBg', '  ') .. '%=' .. right)
+
+  local footer_ns = vim.api.nvim_create_namespace('AiInputFooter')
+  local cwd = vim.fn.fnamemodify(vim.fn.getcwd(), ':t')
+  local footer_chunks = {
+    { '  +', 'AiBadgeAttach' },
+    { '  <> ' .. agent_name, 'AiBadgeChip' },
+    { '  ' .. short_m, 'AiBadgeModel' },
+    { string.rep(' ', math.max(1, W - 18 - vim.fn.strdisplaywidth(agent_name) - vim.fn.strdisplaywidth(short_m) - vim.fn.strdisplaywidth(cwd))), 'AiInputBg' },
+    { '📁 ' .. cwd, 'AiBadgeScope' },
+    { '  ⬆', 'AiBadgeSend' },
+  }
+  vim.api.nvim_buf_clear_namespace(S.input_buf, footer_ns, 0, -1)
+  local row = math.max(0, vim.api.nvim_buf_line_count(S.input_buf) - 1)
+  vim.api.nvim_buf_set_extmark(S.input_buf, footer_ns, row, 0, {
+    virt_lines = { footer_chunks },
+    virt_lines_above = false,
+  })
 end
 
 -- ── Session helpers ───────────────────────────────────────────────────────
@@ -5497,6 +5657,25 @@ local function setup_input_keymaps(slash, at)
   vim.keymap.set('n', 'k', history_back,    e{ desc = 'AI: prev prompt' })
   vim.keymap.set('n', 'j', history_forward, e{ desc = 'AI: next prompt' })
 
+  vim.keymap.set({ 'i', 'n' }, '<C-a>', function()
+    if win_ok(S.input_win) then
+      vim.api.nvim_set_current_win(S.input_win)
+      if vim.api.nvim_get_mode().mode ~= 'i' then vim.cmd('startinsert') end
+      local keys = vim.api.nvim_replace_termcodes('@', true, false, true)
+      vim.api.nvim_feedkeys(keys, 'n', false)
+    end
+  end, e{ desc = 'AI: attach file' })
+
+  vim.keymap.set({ 'i', 'n' }, '<C-p>', function()
+    vim.cmd('stopinsert')
+    process_slash_command('/providers')
+  end, e{ desc = 'AI: providers' })
+
+  vim.keymap.set({ 'i', 'n' }, '<C-m>', function()
+    vim.cmd('stopinsert')
+    process_slash_command('/agents')
+  end, e{ desc = 'AI: agents' })
+
   vim.api.nvim_buf_set_option(buf, 'omnifunc', '')
 
   -- Disable nvim-cmp in the AI input buffer entirely
@@ -6197,6 +6376,27 @@ local function setup_chat_keymaps()
   local bopt = { buffer = buf, noremap = true, silent = true }
   local e    = function(t) return vim.tbl_extend('force', bopt, t) end
 
+  local function maybe_open_recent_session()
+    if not S.showing_welcome then return false end
+    local row = vim.api.nvim_win_get_cursor(S.chat_win)[1]
+    local line = vim.api.nvim_buf_get_lines(S.chat_buf, row - 1, row, false)[1] or ''
+    if not line:find('○', 1, true) then return false end
+    for _, item in ipairs(recent_sessions(5)) do
+      if line:find(item.title, 1, true) then
+        local msgs, agent = sessions.load(item.id)
+        S.messages = msgs or {}
+        S.session_id = item.id
+        if agent and agent ~= '' then agents.activate(agent) end
+        redraw_all()
+        render_topbar()
+        render_input_bar()
+        render_footer()
+        return true
+      end
+    end
+    return false
+  end
+
   vim.keymap.set('n', '<Tab>', function()
     if win_ok(S.input_win) then
       vim.api.nvim_set_current_win(S.input_win)
@@ -6205,6 +6405,7 @@ local function setup_chat_keymaps()
   end, e{ desc = 'AI: focus input' })
 
   vim.keymap.set('n', '<Esc>', function() M.focus_editor() end, e{ desc = 'AI: editor' })
+  vim.keymap.set('n', '<CR>', function() maybe_open_recent_session() end, e{ desc = 'AI: open recent session' })
 
   vim.keymap.set('n', 'q', function() M.close() end, e{ desc = 'AI: close' })
 
