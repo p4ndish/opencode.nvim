@@ -5,6 +5,7 @@ local M = {}
 
 local config      = require('ai.config')
 local ui          = require('ai.ui')
+local terminal_ui = require('ai.terminal')
 local inline_edit = require('ai.inline_edit')
 local diff        = require('ai.diff')
 
@@ -52,10 +53,23 @@ function M.setup(user_config)
   end
 
   -- Toggle sidebar (open + focus, or close)
-  kmap('n', '<leader>ac', function() ui.toggle() end, 'AI: toggle sidebar')
+  kmap('n', '<leader>ac', function()
+    if config.get_ui_mode() == 'terminal' then
+      terminal_ui.toggle()
+    else
+      ui.toggle()
+    end
+  end, 'AI: toggle sidebar')
 
   -- Focus navigation
-  kmap({ 'n', 'i', 'v' }, '<C-Right>', function() ui.focus_input() end,  'AI: focus sidebar input')
+  kmap({ 'n', 'i', 'v' }, '<C-Right>', function()
+    if config.get_ui_mode() == 'terminal' then
+      if not terminal_ui.is_open() then terminal_ui.open() end
+      terminal_ui.focus()
+    else
+      ui.focus_input()
+    end
+  end,  'AI: focus sidebar input')
   kmap({ 'n', 'i', 'v' }, '<C-Left>',  function() ui.focus_editor() end, 'AI: focus editor')
 
   -- Quick model/provider pickers (work without opening sidebar)

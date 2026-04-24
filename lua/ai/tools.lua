@@ -292,16 +292,46 @@ local function exec_write(args)
   f:close()
 
   -- Reload buffer if it's open in Neovim
+  local was_loaded = false
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(buf) then
       local buf_name = vim.api.nvim_buf_get_name(buf)
       if buf_name == path then
+        was_loaded = true
         pcall(vim.api.nvim_buf_call, buf, function()
           vim.cmd('edit!')
         end)
         break
       end
     end
+  end
+
+  -- If the file was newly created (not already open), open it in a new
+  -- vertical split so the user sees it immediately.
+  if not was_loaded then
+    vim.schedule(function()
+      -- Only open if we're not inside the sidebar (avoid disrupting chat)
+      local cur_win = vim.api.nvim_get_current_win()
+      local cur_buf = vim.api.nvim_win_get_buf(cur_win)
+      local cur_ft = vim.api.nvim_buf_get_option(cur_buf, 'filetype') or ''
+      local is_sidebar = cur_ft == 'AiChat' or cur_ft == 'AiInput' or cur_ft == 'AiTopbar'
+      if is_sidebar then
+        -- Focus the last editor window first, then open the file
+        local last_editor = nil
+        for _, w in ipairs(vim.api.nvim_list_wins()) do
+          local b = vim.api.nvim_win_get_buf(w)
+          local ft = vim.api.nvim_buf_get_option(b, 'filetype') or ''
+          if ft ~= 'AiChat' and ft ~= 'AiInput' and ft ~= 'AiTopbar' then
+            last_editor = w
+            break
+          end
+        end
+        if last_editor and vim.api.nvim_win_is_valid(last_editor) then
+          vim.api.nvim_set_current_win(last_editor)
+        end
+      end
+      pcall(vim.cmd, 'edit ' .. vim.fn.fnameescape(path))
+    end)
   end
 
   local line_count = select(2, content:gsub('\n', '\n')) + 1

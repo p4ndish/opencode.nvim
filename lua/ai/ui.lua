@@ -1,5 +1,5 @@
 -- AI Chat UI — Gemini-style
--- Layout: topbar split (top) + chat split (middle) + input split (bottom)
+-- Layout: chat split (top) + input split (bottom) — matching OpenCode session layout
 
 local M = {}
 
@@ -20,8 +20,8 @@ local InlineApply  = require('ai.inline_apply')  -- per-hunk diff in editor buff
 
 -- ── Layout constants ──────────────────────────────────────────────────────
 local W        = 56
-local TOPBAR_H = 3
-local INPUT_H  = 6
+local TOPBAR_H = 2
+local INPUT_H  = 12
 local MIN_COLS = W + 20
 local P        = 3              -- left/right padding inside chat area (increased for breathing room)
 local CHAT_W   = W - 2 * P     -- usable text width
@@ -110,6 +110,12 @@ local S = {
   -- alternative edits and asks the user to clarify instead. Reset at the
   -- start of every submit() and at /new.
   turn_had_rejection = false,
+  prev_laststatus = nil,
+  prev_ruler = nil,
+  -- Float close callbacks (set by setup_slash_complete / setup_at_complete)
+  -- Used to ensure only one autocomplete float is visible at a time.
+  slash_float_close = nil,
+  at_float_close = nil,
 }
 
 -- ── Spinner frames (braille — matches OpenCode's animated progress indicator) ──
@@ -129,6 +135,121 @@ local prompt_builtin_apikey        -- referenced by open_provider_picker
 local prompt_add_custom_provider   -- referenced by open_provider_picker
 local process_slash_command        -- referenced by open_command_picker (defined later)
 local render_footer                -- referenced by prompt_add_custom_provider (defined later)
+
+local INVISIBLE_STL = '%#Normal# '
+
+local function sidebar_statusline_off()
+  if S.prev_laststatus == nil then
+    S.prev_laststatus = vim.o.laststatus
+  end
+  vim.o.laststatus = 0
+  if S.prev_ruler == nil then
+    S.prev_ruler = vim.o.ruler
+  end
+  vim.o.ruler = false
+  -- Nuclear: set every sidebar window's statusline to an invisible expression.
+  -- Even if a plugin resets laststatus asynchronously, the per-window
+  -- statusline renders a single space in the background color — invisible.
+  for _, win in ipairs({ S.chat_win, S.input_win, S.topbar_win }) do
+    if win ~= nil and vim.api.nvim_win_is_valid(win) then
+      pcall(vim.api.nvim_win_set_option, win, 'statusline', INVISIBLE_STL)
+    end
+  end
+end
+
+local function sidebar_statusline_restore()
+  if S.prev_laststatus ~= nil then
+    vim.o.laststatus = S.prev_laststatus
+    S.prev_laststatus = nil
+  end
+  if S.prev_ruler ~= nil then
+    vim.o.ruler = S.prev_ruler
+    S.prev_ruler = nil
+  end
+end
+
+local function sanitize_input_lines(lines, strip_rendered_hint)
+  -- Structural hint stripping: find the first line that is unmistakably
+  -- the UI-generated hint row (always at the bottom, starts with two
+  -- spaces, and contains specific marker pairs) and discard everything
+  -- from that point onward. This fixes duplicate/corrupted hint
+  -- accumulation (e.g. partial "ubmit" ghosts) and avoids stripping
+  -- legitimate user text that merely contains "submit" as a substring.
+  local source = {}
+  for _, line in ipairs(lines or {}) do
+    table.insert(source, tostring(line or ''))
+  end
+
+  -- In the live composer the final buffer line is always the rendered hint
+  -- row. Remove it by position before content matching so partially-overwritten
+  -- hints like "ubmit" cannot survive simply because their marker text was
+  -- damaged by editing/autocmd churn.
+  if strip_rendered_hint and #source > 1 then
+    table.remove(source)
+  end
+
+  local out = {}
+  for _, line in ipairs(source) do
+    local text = tostring(line or '')
+    local is_hint = false
+    -- Hint rows are rendered by render_input_bar() and always start
+    -- with two spaces followed by known left/right marker text.
+    if text:sub(1, 2) == '  ' then
+      local has_enter = text:match('enter submit')
+      local has_esc   = text:match('esc interrupt')
+      local has_at    = text:match('@ file')
+      local has_slash = text:match('/ command')
+      -- Normal mode:  "  enter submit ... @ file ... / command"
+      -- Streaming:    "  ⣾  ... esc interrupt"
+      if (has_enter and (has_at or has_slash)) or has_esc then
+        is_hint = true
+      end
+    end
+    if strip_rendered_hint and text:sub(1, 2) == '  ' then
+      local trimmed = vim.trim(text)
+      if trimmed:match('submit')
+          or trimmed:match('ubmit')
+          or trimmed:match('interrupt')
+          or trimmed:match('file%s*·')
+          or trimmed:match('/%s*command')
+          or trimmed:match('command$') then
+        is_hint = true
+      end
+    end
+    if is_hint then break end -- strip this line and everything after it
+    table.insert(out, text)
+  end
+  while #out > 0 and vim.trim(out[#out]) == '' do
+    table.remove(out)
+  end
+  return out
+end
+
+local function active_input_row()
+  if S.input_win and vim.api.nvim_win_is_valid(S.input_win) then
+    local row = vim.api.nvim_win_get_cursor(S.input_win)[1]
+    if row < 1 then return 1 end
+    if S.input_buf and vim.api.nvim_buf_is_valid(S.input_buf) then
+      local total = vim.api.nvim_buf_line_count(S.input_buf)
+      local last_editable = math.max(1, total - 1)
+      if row > last_editable then return last_editable end
+    end
+    return row
+  end
+  return 1
+end
+
+local function focus_input_preserve_cursor(start_insert)
+  if not S.input_win or not vim.api.nvim_win_is_valid(S.input_win)
+      or not S.input_buf or not vim.api.nvim_buf_is_valid(S.input_buf) then return end
+  local cur = vim.api.nvim_win_get_cursor(S.input_win)
+  vim.api.nvim_set_current_win(S.input_win)
+  local row = active_input_row()
+  local line = vim.api.nvim_buf_get_lines(S.input_buf, row - 1, row, false)[1] or ''
+  local col = math.min(vim.fn.strchars(line), math.max(0, cur[2]))
+  pcall(vim.api.nvim_win_set_cursor, S.input_win, { row, col })
+  if start_insert then vim.cmd('startinsert') end
+end
 
 -- ── Spinner helpers ───────────────────────────────────────────────────────
 -- Braille spinner that animates while streaming (120ms per frame).
@@ -382,6 +503,7 @@ local function setup_highlights()
   hl('AiTopProvider', { bg = C.bg, fg = C.fg3 })
   hl('AiTopSep',      { bg = C.bg, fg = C.sep })
   hl('AiTopStream',   { bg = C.bg, fg = C.secondary, bold = true })
+  hl('AiChatSep',     { bg = C.bg, fg = C.sep })
   hl('AiTopTokens',   { bg = C.bg, fg = C.fg3 })
 
   -- User message block (OpenCode: left ┃ border in secondary, bg = backgroundPanel)
@@ -391,7 +513,7 @@ local function setup_highlights()
 
   -- Assistant message (OpenCode: no bg, text = theme.text, paddingLeft=3)
   hl('AiAsstAvatar',     { bg = C.bg, fg = C.secondary, bold = true })
-  hl('AiAsstText',       { bg = C.bg, fg = C.fg })
+  hl('AiAsstText',       { bg = C.bg_panel, fg = C.fg })
   hl('AiAsstBorder',     { bg = C.bg, fg = C.secondary })  -- thin │ in agent color
   -- Per-message toolbar (Change A — Cursor-style icon row)
   hl('AiMsgToolbar',     { bg = C.bg, fg = C.fg3 })
@@ -415,6 +537,7 @@ local function setup_highlights()
 
   -- Input left border (OpenCode: agent-colored ┃ on input pane)
   hl('AiInputBorder', { bg = C.bg_input, fg = C.secondary })
+  hl('AiInputBorderBar', { bg = C.bg_input, fg = C.fg3 })
   hl('AiInputPlaceholder', { bg = C.bg_input, fg = C.fg3 })
 
   -- Input bar winbar chips
@@ -544,15 +667,33 @@ local function recent_sessions(limit)
   return out
 end
 
+local function current_session_title()
+  for _, msg in ipairs(S.messages or {}) do
+    if msg.role == 'user' and msg.content and vim.trim(msg.content) ~= '' then
+      local title = vim.trim(msg.content):gsub('\n.*', '')
+      if vim.fn.strdisplaywidth(title) > 30 then
+        title = title:sub(1, 28) .. '…'
+      end
+      return title
+    end
+  end
+  return 'New session'
+end
+
 -- ── Buffer / window helpers ───────────────────────────────────────────────
 -- Sidebar buffers need a stable filetype so editor integrations can opt out.
 local function make_buf(name, mod, ft)
   local buf = vim.api.nvim_create_buf(false, true)
-  pcall(vim.api.nvim_buf_set_name, buf, name)
+  -- Intentionally NOT naming the buffer — names leak into the default
+  -- statusline format when a plugin overrides laststatus, producing
+  -- "AI:header [-]" and "AI:chat [-]" chrome inside the sidebar.
   vim.api.nvim_buf_set_option(buf, 'buftype',   'nofile')
   vim.api.nvim_buf_set_option(buf, 'swapfile',  false)
   vim.api.nvim_buf_set_option(buf, 'buflisted', false)
   vim.api.nvim_buf_set_option(buf, 'bufhidden', 'wipe')
+  vim.api.nvim_buf_set_option(buf, 'completefunc', '')
+  vim.api.nvim_buf_set_option(buf, 'omnifunc', '')
+  vim.api.nvim_buf_set_option(buf, 'syntax', 'OFF')
   if ft then
     vim.api.nvim_buf_set_option(buf, 'filetype', ft)
   end
@@ -560,6 +701,19 @@ local function make_buf(name, mod, ft)
     vim.api.nvim_buf_set_option(buf, 'modifiable', mod)
   end
   return buf
+end
+
+local function disable_input_integrations(buf)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
+  pcall(vim.api.nvim_buf_set_option, buf, 'completefunc', '')
+  pcall(vim.api.nvim_buf_set_option, buf, 'omnifunc', '')
+  pcall(vim.api.nvim_buf_set_option, buf, 'syntax', 'OFF')
+  pcall(vim.api.nvim_buf_set_option, buf, 'tagfunc', '')
+  pcall(function() vim.b[buf].completion = false end)
+  pcall(function() vim.b[buf].cmp_enabled = false end)
+  pcall(function() vim.b[buf].blink_cmp_enabled = false end)
+  local ok_cmp, cmp = pcall(require, 'cmp')
+  if ok_cmp then cmp.setup.buffer({ enabled = false }) end
 end
 
 local function bset(buf, s, e, lines)
@@ -806,114 +960,25 @@ local function fmt_tok(n)
 end
 
 render_topbar = function()
-  if not S.topbar_win or not win_ok(S.topbar_win) then return end
   if not S.topbar_buf or not vim.api.nvim_buf_is_valid(S.topbar_buf) then return end
 
-  local provider  = config.get_provider()
-  local model     = config.get_model()
-  local disp_m    = #model > 22 and (model:sub(1, 20) .. '…') or model
-  local streaming = S.is_streaming
+  local title = current_session_title()
+  local model = config.get_model() or ''
+  local agent_name = (agents.active_name and agents.active_name()) or 'Code'
+  local meta = string.format('%s · %s', agent_name, model)
 
-  local function fit(text, width)
-    if width <= 0 then return '' end
-    if vim.fn.strdisplaywidth(text) <= width then
-      return text .. string.rep(' ', math.max(0, width - vim.fn.strdisplaywidth(text)))
-    end
-    if width <= 1 then return string.rep(' ', width) end
-    return text:sub(1, math.max(1, width - 1)) .. '…'
-  end
-
-  local function pad_left(text, width)
-    local dw = vim.fn.strdisplaywidth(text)
-    if dw >= width then return fit(text, width) end
-    return string.rep(' ', width - dw) .. text
-  end
-
-  local actions = table.concat({
-    ICONS.new,
-    ICONS.sessions,
-    ICONS.providers,
-    ICONS.more,
-    ICONS.close,
-  }, '  ')
-
-  local left = '  Agents ' .. ICONS.dropdown
-  local row0_w = math.max(0, W - 1)
-  local row0_left_w = math.max(0, row0_w - vim.fn.strdisplaywidth(actions) - 2)
-  local line0 = fit(left, row0_left_w) .. '  ' .. actions
-
-  local right = ''
-  if streaming then
-    right = right .. '● '
-  end
-  if S.token_last.prompt > 0 or S.token_last.completion > 0 then
-    local tok_str = '↑' .. fmt_tok(S.token_last.prompt)
-      .. ' ↓' .. fmt_tok(S.token_last.completion)
-    right = right .. tok_str .. '  '
-  end
-  right = right .. provider .. ' · ' .. disp_m
-  local line2 = pad_left(right, row0_w)
-
+  local prefix = '  '
   pcall(vim.api.nvim_buf_set_option, S.topbar_buf, 'modifiable', true)
-  vim.api.nvim_buf_set_lines(S.topbar_buf, 0, -1, false,
-    { line0, string.rep('─', row0_w), line2 })
-  pcall(vim.api.nvim_win_set_option, S.topbar_win, 'winbar', '')
-  if NS_TOPBAR then
-    vim.api.nvim_buf_clear_namespace(S.topbar_buf, NS_TOPBAR, 0, -1)
-    vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 0, 2, {
-      end_col = math.min(#line0, 2 + #'Agents'),
-      hl_group = 'AiTopTitle',
-    })
-    vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 0, math.min(#line0, 9), {
-      end_col = math.min(#line0, 11),
-      hl_group = 'AiTopArrow',
-    })
-
-    local action_specs = {
-      { text = ICONS.new,       hl = 'AiTopAction' },
-      { text = ICONS.sessions,  hl = 'AiTopActionAlt' },
-      { text = ICONS.providers, hl = 'AiTopActionAlt' },
-      { text = ICONS.more,      hl = 'AiTopActionAlt' },
-      { text = ICONS.close,     hl = 'AiTopClose' },
-    }
-    local action_col = math.max(0, #line0 - #actions)
-    for i, spec in ipairs(action_specs) do
-      local start_col = line0:find(spec.text, action_col + 1, true)
-      if start_col then
-        vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 0, start_col - 1, {
-          end_col = start_col - 1 + #spec.text,
-          hl_group = spec.hl,
-        })
-        action_col = start_col + #spec.text
-      end
-    end
-
-    vim.api.nvim_buf_add_highlight(S.topbar_buf, NS_TOPBAR, 'AiTopSep', 1, 0, -1)
-
-    local row2 = line2
-    local model_start = row2:find(disp_m, 1, true)
-    local provider_start = row2:find(provider, 1, true)
-    if provider_start then
-      vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 2, provider_start - 1, {
-        end_col = provider_start - 1 + #provider,
-        hl_group = 'AiTopProvider',
-      })
-    end
-    if model_start then
-      vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 2, model_start - 1, {
-        end_col = model_start - 1 + #disp_m,
-        hl_group = 'AiTopMeta',
-      })
-    end
-    local stream_col = row2:find('● ', 1, true)
-    if stream_col then
-      vim.api.nvim_buf_set_extmark(S.topbar_buf, NS_TOPBAR, 2, stream_col - 1, {
-        end_col = stream_col,
-        hl_group = 'AiTopStream',
-      })
-    end
-  end
+  vim.api.nvim_buf_set_lines(S.topbar_buf, 0, -1, false, {
+    prefix .. title,
+    prefix .. meta,
+  })
   pcall(vim.api.nvim_buf_set_option, S.topbar_buf, 'modifiable', false)
+
+  local ns = vim.api.nvim_create_namespace('AiTopbarNS')
+  vim.api.nvim_buf_clear_namespace(S.topbar_buf, ns, 0, -1)
+  pcall(vim.api.nvim_buf_add_highlight, S.topbar_buf, ns, 'AiTopTitle', 0, 0, -1)
+  pcall(vim.api.nvim_buf_add_highlight, S.topbar_buf, ns, 'AiTopMeta', 1, 0, -1)
 end
 
 -- ── Top bar keymaps / pickers ─────────────────────────────────────────────
@@ -2532,6 +2597,7 @@ local function setup_topbar_keymaps()
   vim.keymap.set('n', '<Tab>', function()
     if win_ok(S.input_win) then
       vim.api.nvim_set_current_win(S.input_win)
+      pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, 0 })
       vim.cmd('startinsert')
     end
   end, e{ desc = 'AI: focus input' })
@@ -2540,47 +2606,12 @@ end
 
 
 -- ── Welcome screen ───────────────────────────────────────────────────────
--- Gemini style:
---   ✦  (sparkle, centred)
---   "Hello there"     bold, centred
---   "Where would you like to start?"  muted, centred
---   [blank space]
---   suggestion chips pushed to bottom:
---     [ ✦ Create image ]  [ ◎ Help me learn ]
---     [ ✎ Write anything] [ ⚡ Boost my day  ]
+-- OpenCode style: minimal, just a sparkle marker and breathing room.
+-- No command list — that shows in the prompt placeholder instead.
 
 local function render_welcome()
   if not S.chat_buf or not vim.api.nvim_buf_is_valid(S.chat_buf) then return end
   S.showing_welcome = true
-
-  local chat_h = 30
-  if win_ok(S.chat_win) then
-    chat_h = vim.api.nvim_win_get_height(S.chat_win)
-  end
-
-  local pad_str = string.rep(' ', P)
-  local function cpad(s)
-    local dw = vim.fn.strdisplaywidth(s)
-    if dw >= CHAT_W then return pad_str .. s end
-    local lp = math.floor((CHAT_W - dw) / 2)
-    return pad_str .. string.rep(' ', lp) .. s
-  end
-
-  -- Windsurf-style centered intro with recent sessions below.
-  local ctr = {}
-  local ctr_hl = {}
-  local function cpush(s, h) table.insert(ctr, s); ctr_hl[#ctr] = h end
-
-  cpush(cpad(ICONS.spark),                      'AiSparkle')
-  cpush('',                                     'AiChatBg')
-  cpush(cpad('PandaVim AI'),                    'AiWelcomeHi')
-  cpush('',                                     'AiChatBg')
-  cpush(cpad('Kick off a new session. Edit code in place.'), 'AiWelcomeTitle')
-
-  -- Vertically center the block
-  local recents = recent_sessions(5)
-  local sessions_block_h = (#recents > 0) and (#recents + 2) or 0
-  local top_pad = math.max(2, math.floor((chat_h - #ctr - sessions_block_h) / 2))
 
   local all_lines, all_hl = {}, {}
   local function push(s, h)
@@ -2588,26 +2619,14 @@ local function render_welcome()
     if h then all_hl[#all_lines - 1] = h end
   end
 
-  for _ = 1, top_pad do push('', 'AiChatBg') end
-  for i, l in ipairs(ctr) do push(l, ctr_hl[i]) end
-  if #recents > 0 then
-    push('', 'AiChatBg')
-    push(pad_str .. 'Recent sessions', 'AiWelcomeLabel')
-    for _, item in ipairs(recents) do
-      local title = item.title or 'Untitled'
-      if vim.fn.strdisplaywidth(title) > CHAT_W - 10 then
-        title = title:sub(1, CHAT_W - 12) .. '…'
-      end
-      local stamp = rel_time(item.updated_at)
-      local line = pad_str .. '  ○ ' .. title
-      local gap = math.max(1, CHAT_W - vim.fn.strdisplaywidth('  ○ ' .. title) - vim.fn.strdisplaywidth(stamp))
-      line = line .. string.rep(' ', gap) .. stamp
-      push(line, 'AiSessionRow')
-    end
-  end
-  -- Fill remaining space
-  local remaining = math.max(0, chat_h - top_pad - #ctr)
-  for _ = 1, remaining do push('', 'AiChatBg') end
+  push('', 'AiChatBg')
+  push(string.rep(' ', P) .. 'PandaVim AI', 'AiWelcomeHi')
+  push(string.rep(' ', P) .. 'Ask, edit, and explore your project.', 'AiWelcomeSub')
+  push('', 'AiChatBg')
+  push(string.rep(' ', P) .. '/providers  connect or switch provider', 'AiWelcomeSub')
+  push(string.rep(' ', P) .. '/model      switch model', 'AiWelcomeSub')
+  push(string.rep(' ', P) .. '/agents     pick an agent preset', 'AiWelcomeSub')
+  push(string.rep(' ', P) .. '@file       attach file context', 'AiWelcomeSub')
 
   pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', true)
   vim.api.nvim_buf_set_lines(S.chat_buf, 0, -1, false, all_lines)
@@ -2615,23 +2634,6 @@ local function render_welcome()
     vim.api.nvim_buf_clear_namespace(S.chat_buf, NS_CHAT, 0, -1)
     for row, h in pairs(all_hl) do
       vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, h, row, 0, -1)
-    end
-    if #recents > 0 then
-      local first_row = top_pad + #ctr + 1
-      vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiWelcomeLabel', first_row, 0, -1)
-      for idx, item in ipairs(recents) do
-        local row = first_row + idx
-        local line = all_lines[row + 1] or ''
-        local dot_col = line:find('○', 1, true)
-        local stamp = rel_time(item.updated_at)
-        local stamp_col = line:find(stamp, 1, true)
-        if dot_col then
-          vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiSessionDot', row, dot_col - 1, dot_col)
-        end
-        if stamp_col then
-          vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiSessionTime', row, stamp_col - 1, -1)
-        end
-      end
     end
   end
   pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', false)
@@ -2695,9 +2697,8 @@ local function render_markdown_highlights(buf_start_row, _raw_text)
     -- Stop at footer line (▣)
     if buf_line:match('▣') then break end
 
-    -- Strip the new prefix "   │ ✦  " or "   │    " to get actual content.
-    -- │ is a 3-byte UTF-8 character; ✦ is 3-byte as well.
-    local content = buf_line:gsub('^%s*│%s*✦?%s*', '')
+    -- Strip the left padding to get actual content (OpenCode: paddingLeft={3})
+    local content = buf_line:gsub('^%s*', '')
     -- Track where the actual content starts in the buffer line
     local content_start = #buf_line - #content
 
@@ -2765,29 +2766,34 @@ end
 
 
 --
--- USER  — right-aligned bubble:
---   (blank spacer)
---   ░░░░░░░░░░░░░░░░░░░ text line ░  <- bg_user highlight, right-padded
---   (timestamp right-aligned, muted)
+-- USER — left-bordered panel (OpenCode backgroundPanel + left ┃ border):
+--   blank spacer
+--   ┃  text line                <- AiUserBlock bg, AiUserBorder left bar
+--   timestamp (muted)
 --
--- ASSISTANT — left-aligned, no bubble:
---   ✦  text starts here word-wrapped   <- sparkle on first line only
---      continuation lines indented
---   (timestamp muted)
+-- ASSISTANT — plain text, no bubble:
+--   ▣ Code · provider · model   <- meta line (AiAsstMeta)
+--   text starts here            <- AiAsstText, paddingLeft=3
+--   continuation lines indented
 --
--- The bubble "width" for user = min(text_w + 4, W - 4).
--- Right-aligning: we left-pad with spaces on bg to push bubble right.
-
 -- Padding applied to every content line in the chat buffer.
--- P = left/right margin (2 spaces each side).
--- This simulates CSS padding:2 inside the chat area.
--- The effective text width is W - 2*P.
--- Aliases for streaming code — match the new bar-prefixed layout.
--- ASST_INDENT is used by stream_begin for the initial sparkle line.
--- ASST_CONT is used by stream_end for the timestamp + footer lines (no bar —
--- the footer is visually separated from the response).
-local ASST_INDENT  = '   │ ✦  '
-local ASST_CONT    = '   │    '
+-- P = left margin (3 spaces). Effective text width = W - 2*P.
+
+-- Assistant text prefix: 3-space left padding (OpenCode paddingLeft={3})
+local ASST_PAD_L = string.rep(' ', P)
+
+local function assistant_meta_text(include_live)
+  local agent_name = (agents.active_name and agents.active_name()) or 'Code'
+  if not agent_name or agent_name == '' then agent_name = 'Code' end
+  local provider = config.get_provider() or ''
+  local model = config.get_model() or ''
+  local parts = {}
+  if include_live then table.insert(parts, '●') end
+  table.insert(parts, agent_name)
+  if provider ~= '' then table.insert(parts, provider) end
+  if model ~= '' then table.insert(parts, model) end
+  return string.rep(' ', P) .. '▣ ' .. table.concat(parts, ' · ')
+end
 
 -- Append a user message block (OpenCode-style: left ┃ border, bg #141414, full-width)
 local USER_BORDER = '┃'
@@ -2830,8 +2836,13 @@ local function append_user(text, attachments)
   local base = vim.api.nvim_buf_line_count(S.chat_buf)
   local add  = {}
 
-  -- Blank line before each message (marginTop=1, like OpenCode)
-  if base > 0 then table.insert(add, '') end
+  -- marginTop: 2 blank lines between messages, 1 before first message
+  if base > 0 then
+    table.insert(add, '')
+    table.insert(add, '')
+  else
+    table.insert(add, '')
+  end
 
   -- Top padding inside the block (paddingTop=1 like OpenCode)
   table.insert(add, pad_to_width(USER_PREFIX))
@@ -3038,12 +3049,14 @@ function M._msg_regenerate(msg_idx)
   -- Inject the prompt into the input pane and fire submit
   if S.input_buf and vim.api.nvim_buf_is_valid(S.input_buf) then
     pcall(vim.api.nvim_buf_set_option, S.input_buf, 'modifiable', true)
-    vim.api.nvim_buf_set_lines(S.input_buf, 0, -1, false,
+    vim.api.nvim_buf_set_lines(S.input_buf, 0, INPUT_H - 1, false,
       vim.split(user_msg.content or '', '\n', { plain = true }))
     pcall(vim.api.nvim_buf_set_option, S.input_buf, 'modifiable', false)
+    render_input_bar()
     -- Focus input then trigger submit
     if win_ok(S.input_win) then
       vim.api.nvim_set_current_win(S.input_win)
+      pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, 0 })
       vim.schedule(function()
         if submit then submit() end
       end)
@@ -3075,10 +3088,9 @@ end
 -- Append an assistant message.
 -- Visual style: thin │ bar in agent color at column P, then indented text.
 -- Matches avante's subtle left-border pattern while staying non-modal.
--- Layout:  "   │ ✦  text"   (first line)
---          "   │    text"   (continuation)
--- The bar is highlighted with AiAsstBorder (agent color); the text with AiAsstText.
--- F3: normalize assistant text whitespace before render.
+  -- Layout:  "   ▣ Code · provider · model"   (meta line)
+  --          "   text"                       (continuation)
+  -- F3: normalize assistant text whitespace before render.
 -- - Strip trailing blank lines (models often emit \n\n at end of turn)
 -- - Collapse 3+ consecutive newlines to 2 (visual stripe → single blank)
 local function normalize_assistant_text(s)
@@ -3092,14 +3104,6 @@ end
 
 -- Test export (stable underscore-prefixed surface; matches M._render_inline_summary etc.)
 M._normalize_assistant_text = normalize_assistant_text
-
-local ASST_BAR     = '│'
-local ASST_PAD_L   = string.rep(' ', P)                -- 3 leading spaces
-local ASST_AVATAR  = ASST_PAD_L .. ASST_BAR .. ' ✦  ' -- pad + bar + space + sparkle + 2 spaces
-local ASST_TEXT_PFX = ASST_PAD_L .. ASST_BAR .. '    ' -- pad + bar + 4 spaces (same width as AVATAR)
--- Byte range of the bar character for highlighting: after the leading pad
-local ASST_BAR_START = #ASST_PAD_L
-local ASST_BAR_END   = ASST_BAR_START + #ASST_BAR
 
 local function append_assistant(text)
   if not S.chat_buf or not vim.api.nvim_buf_is_valid(S.chat_buf) then return end
@@ -3115,93 +3119,48 @@ local function append_assistant(text)
 
   pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', true)
   local base    = vim.api.nvim_buf_line_count(S.chat_buf)
-  local inner_w = W - vim.fn.strdisplaywidth(ASST_AVATAR) - P  -- minus right padding
+  local inner_w = W - (2 * P)
   local wrapped = wrap_text(text, inner_w)
   local add     = {}
 
-  -- marginTop=1 (blank line before)
-  if base > 0 then table.insert(add, '') end
-
-  -- Text lines: sparkle on first line, continuation prefix on rest.
-  -- F5: blank-content lines get a no-bar prefix (just spaces) so we don't
-  -- paint a visible │ stripe on padding/whitespace lines.
-  local blank_rows = {}  -- 1-indexed rows in `wrapped` that are blank
-  local NO_BAR_PFX = string.rep(' ', vim.fn.strdisplaywidth(ASST_TEXT_PFX))
-  for j, l in ipairs(wrapped) do
-    local is_blank = vim.trim(l) == ''
-    local prefix
-    if is_blank then
-      prefix = NO_BAR_PFX
-      blank_rows[j] = true
-    else
-      prefix = j == 1 and ASST_AVATAR or ASST_TEXT_PFX
-    end
-    table.insert(add, prefix .. l)
+  -- marginTop: always at least 1 blank line for breathing room after the
+  -- header separator or previous message; 2 lines between messages.
+  if base > 0 then
+    table.insert(add, '')
+    table.insert(add, '')
+  else
+    table.insert(add, '')
   end
 
-  -- Footer: ▣ AgentName · model · duration · timestamp
-  local icon = '▣'
-  local agent_name = (agents.active_name and agents.active_name()) or 'Code'
-  if not agent_name or agent_name == '' then agent_name = 'Code' end
-  local model_name = config.get_model():match('([^/]+)$') or config.get_model()
-  local fparts = { icon .. ' ' .. agent_name, model_name }
-  if S.turn_start_time then
-    local dur = os.time() - S.turn_start_time
-    if dur >= 60 then
-      table.insert(fparts, string.format('%dm%ds', math.floor(dur/60), dur%60))
-    else
-      table.insert(fparts, dur .. 's')
-    end
+  table.insert(add, assistant_meta_text(false))
+  for _, l in ipairs(wrapped) do
+    local line = string.rep(' ', P) .. (vim.trim(l) == '' and '' or l)
+    -- Pad to full width so bg_panel fills the entire visible row
+    local dw = vim.fn.strdisplaywidth(line)
+    if dw < W then line = line .. string.rep(' ', W - dw) end
+    table.insert(add, line)
   end
-  if S.show_timestamps then
-    table.insert(fparts, os.date('%H:%M'))
-  end
-  -- Blank line before footer for breathing room
-  table.insert(add, '')
-  local footer_line = ASST_TEXT_PFX .. table.concat(fparts, ' · ')
-  table.insert(add, footer_line)
 
   vim.api.nvim_buf_set_lines(S.chat_buf, base, base, false, add)
 
   if NS_CHAT then
     local off = base
     local i   = (base > 0) and 1 or 0
-    -- Text lines: AiAsstText on full row, then bar overlay (skipped on blanks), then sparkle on first
-    for j = 0, #wrapped - 1 do
-      pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstText', off + i + j, 0, -1)
-      -- F5: skip bar overlay on blank-content lines (the prefix is already
-      -- substituted with spaces in the buffer above, so there's no │ glyph).
-      if not blank_rows[j + 1] then
-        pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstBorder',
-          off + i + j, ASST_BAR_START, ASST_BAR_END)
-      end
+    pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstMeta', off + i, 0, -1)
+    pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstFooterIcon', off + i, P, P + #'▣')
+    for j = 1, #wrapped do
+      local row = off + i + j
+      pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstText', row, 0, -1)
     end
-    -- Sparkle avatar color on first line (the ✦ character starts after bar+space)
-    local sparkle_start = ASST_BAR_END + 1  -- +1 for the space after the bar
-    pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstAvatar',
-      off + i, sparkle_start, sparkle_start + #'✦')
-    -- Footer line (after blank line): icon in agent color, rest muted
-    local footer_row = off + i + #wrapped + 1  -- +1 for the blank line
-    pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstFooter', footer_row, 0, -1)
-    local icon_start = #ASST_TEXT_PFX
-    local icon_end   = icon_start + #icon
-    pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstFooterIcon', footer_row, icon_start, icon_end)
   end
 
   pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', false)
 
-  -- Post-render markdown highlights
-  local first_text_row = base + ((base > 0) and 1 or 0)
+  -- Post-render markdown highlights on assistant body rows
+  local first_text_row = base + ((base > 0) and 2 or 1)
   render_markdown_highlights(first_text_row, text)
 
-  -- Change A: per-message action toolbar below the footer row
-  local footer_row = first_text_row + #wrapped + 1
-  -- S.messages has just had the assistant response appended by submit/stream
-  local msg_idx = #S.messages
-  vim.schedule(function()
-    render_message_toolbar(footer_row, msg_idx)
-    scroll_bottom(S.chat_win, S.chat_buf)
-  end)
+  vim.schedule(function() scroll_bottom(S.chat_win, S.chat_buf) end)
 end
 
 -- Generic dispatch used by submit/stream paths.
@@ -3416,7 +3375,7 @@ end
 
 
 -- ── Streaming (Gemini style) ──────────────────────────────────────────────
--- stream_begin: write the sparkle prefix line, record where text starts
+  -- stream_begin: write the meta prefix line, record where text starts
 -- stream_chunk: replace text lines in-place as chunks arrive
 -- stream_end:   append timestamp, finalise
 
@@ -3431,32 +3390,33 @@ local function stream_begin()
 
   -- Begin showing the bottom state spinner (violet generating badge).
   state_set('generating')
+  S.scroll_pinned = true
 
   pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', true)
   local lc  = vim.api.nvim_buf_line_count(S.chat_buf)
   local add = {}
-  if lc > 0 then table.insert(add, '') end
-  -- first text line (empty placeholder with sparkle)
-  table.insert(add, ASST_INDENT)
+  if lc > 0 then
+    table.insert(add, '')
+    table.insert(add, '')
+  else
+    table.insert(add, '')
+  end
+  table.insert(add, assistant_meta_text(true))
+  table.insert(add, string.rep(' ', P))
 
   vim.api.nvim_buf_set_lines(S.chat_buf, lc, lc, false, add)
   if NS_CHAT then
     local row = lc + (lc > 0 and 1 or 0)
-    vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiAsstText', row, 0, -1)
-    -- Bar in agent color
-    pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstBorder',
-      row, ASST_BAR_START, ASST_BAR_END)
-    -- Sparkle in agent color (starts after "│ ")
-    local sparkle_start = ASST_BAR_END + 1
-    vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiAsstAvatar',
-      row, sparkle_start, sparkle_start + #'✦')
+    vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiAsstMeta', row, 0, -1)
+    vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiAsstFooterIcon', row, P, P + #'▣')
+    vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiAsstText', row + 1, 0, -1)
   end
   pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', false)
   render_topbar()
   render_input_bar()
 
   -- return 0-indexed row of first text line
-  return lc + (lc > 0 and 1 or 0)
+  return lc + (lc > 0 and 2 or 1)
 end
 
 -- Throttled markdown refresh during streaming (60ms). Re-renders markdown
@@ -3482,20 +3442,14 @@ local function stream_chunk(chunk)
   -- Don't mutate S.stream_text itself — the raw stream is still useful for
   -- tool detection. Only apply normalization to the WRAPPED render path.
   local display_text = normalize_assistant_text(S.stream_text)
-  local text_w    = W - vim.fn.strdisplaywidth(ASST_AVATAR) - P  -- account for right padding
+  local text_w    = W - (2 * P)
   local wrapped   = wrap_text(display_text, text_w)
-  -- F5: track which lines are blank so we can skip the bar prefix + highlight.
-  local NO_BAR_PFX = string.rep(' ', vim.fn.strdisplaywidth(ASST_TEXT_PFX))
-  local blank_rows = {}
   local new_lines = {}
   for j, l in ipairs(wrapped) do
-    local is_blank = vim.trim(l) == ''
-    if is_blank then
-      new_lines[j] = NO_BAR_PFX .. l
-      blank_rows[j] = true
-    else
-      new_lines[j] = (j == 1 and ASST_AVATAR or ASST_TEXT_PFX) .. l
-    end
+    local line = string.rep(' ', P) .. (vim.trim(l) == '' and '' or l)
+    local dw = vim.fn.strdisplaywidth(line)
+    if dw < W then line = line .. string.rep(' ', W - dw) end
+    new_lines[j] = line
   end
 
   pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', true)
@@ -3505,16 +3459,6 @@ local function stream_chunk(chunk)
     for j = 0, #new_lines - 1 do
       local row = S.stream_line + j
       vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiAsstText', row, 0, -1)
-      -- F5: skip bar on blank rows
-      if not blank_rows[j + 1] then
-        pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstBorder',
-          row, ASST_BAR_START, ASST_BAR_END)
-        if j == 0 then
-          local sparkle_start = ASST_BAR_END + 1
-          vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiAsstAvatar',
-            row, sparkle_start, sparkle_start + #'✦')
-        end
-      end
     end
   end
   pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', false)
@@ -3531,11 +3475,10 @@ local function stream_end()
   if S.chat_buf and vim.api.nvim_buf_is_valid(S.chat_buf) then
     pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', true)
 
-    -- Strip any trailing blank lines first (ensure_bottom_margin adds
-    -- padding during streaming; we want the timestamp / footer to sit
-    -- directly underneath the last content line, not after the padding).
+    -- Strip excess trailing blank lines added by ensure_bottom_margin during
+    -- streaming, but keep 1 blank line for breathing room after the response.
     local lc = vim.api.nvim_buf_line_count(S.chat_buf)
-    while lc > 0 do
+    while lc > 1 do
       local line = vim.api.nvim_buf_get_lines(S.chat_buf, lc - 1, lc, false)[1] or ''
       if vim.trim(line) == '' then
         pcall(vim.api.nvim_buf_set_lines, S.chat_buf, lc - 1, lc, false, {})
@@ -3545,48 +3488,29 @@ local function stream_end()
       end
     end
 
-    -- Timestamp line
-    local ts = ASST_CONT .. os.date('%H:%M')
-    vim.api.nvim_buf_set_lines(S.chat_buf, lc, lc, false, { ts })
-    if NS_CHAT then
-      vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiAsstMeta', lc, 0, -1)
-    end
-
-    -- Response footer: ▣  agent · model · Ns  (matches OpenCode's text-part-meta)
-    local elapsed = os.time() - (S.turn_start_time or os.time())
-    local dur_str
-    if elapsed < 60 then
-      dur_str = elapsed .. 's'
-    else
-      dur_str = math.floor(elapsed / 60) .. 'm ' .. (elapsed % 60) .. 's'
-    end
-    local footer_parts = {}
-    local ta = S.turn_agent
-    if ta and ta ~= '' then table.insert(footer_parts, ta) end
-    table.insert(footer_parts, S.turn_model or config.get_model())
-    table.insert(footer_parts, dur_str)
-    local footer = ASST_CONT .. '▣  ' .. table.concat(footer_parts, ' · ')
-    local footer_row = lc + 1
-    vim.api.nvim_buf_set_lines(S.chat_buf, footer_row, footer_row, false, { footer })
-    if NS_CHAT then
-      vim.api.nvim_buf_add_highlight(S.chat_buf, NS_CHAT, 'AiAsstMeta', footer_row, 0, -1)
-    end
-
     pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', false)
   end
   -- F3: normalize the final stored content (so future redraws via append_assistant
-  -- and any /copy / message-toolbar operations see the cleaned-up version).
+  -- and any /copy operations see the cleaned-up version).
   local final_text = normalize_assistant_text(S.stream_text)
   table.insert(S.messages, { role = 'assistant', content = final_text })
+  -- Update meta line: remove the live dot now that streaming is done
+  if S.chat_buf and vim.api.nvim_buf_is_valid(S.chat_buf) and S.stream_line then
+    local meta_row = S.stream_line - 1
+    if meta_row >= 0 then
+      pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', true)
+      pcall(vim.api.nvim_buf_set_lines, S.chat_buf, meta_row, meta_row + 1, false, { assistant_meta_text(false) })
+      pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstMeta', meta_row, 0, -1)
+      pcall(vim.api.nvim_buf_add_highlight, S.chat_buf, NS_CHAT, 'AiAsstFooterIcon', meta_row, P, P + #'▣')
+      pcall(vim.api.nvim_buf_set_option, S.chat_buf, 'modifiable', false)
+    end
+  end
   -- Capture stream_line before clearing — needed for markdown post-render
   local md_start = S.stream_line
   S.stream_line = nil
   -- Apply markdown highlights to the streamed block before clearing stream_text
   render_markdown_highlights(md_start, final_text)
   S.stream_text = ''
-  -- Change A: per-message toolbar below the footer line
-  local toolbar_row = vim.api.nvim_buf_line_count(S.chat_buf) - 1
-  render_message_toolbar(toolbar_row, #S.messages)
   -- Heuristic tool-support detection: if the model responded with text that
   -- looks like "here's how to do it" but didn't call any tools, mark the
   -- provider as needing ReAct fallback for future requests.
@@ -4268,14 +4192,17 @@ end
 -- ── Input helpers ─────────────────────────────────────────────────────────
 local function get_input_text()
   if not S.input_buf or not vim.api.nvim_buf_is_valid(S.input_buf) then return '' end
+  -- Read ALL lines and filter out the rendered bottom hint row.
   local lines = vim.api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
+  lines = sanitize_input_lines(lines, true)
   return vim.trim(table.concat(lines, '\n'))
 end
 
 local function clear_input()
   if not S.input_buf or not vim.api.nvim_buf_is_valid(S.input_buf) then return end
   pcall(vim.api.nvim_buf_set_option, S.input_buf, 'modifiable', true)
-  vim.api.nvim_buf_set_lines(S.input_buf, 0, -1, false, { '' })
+  vim.api.nvim_buf_set_lines(S.input_buf, 0, -1, false, {})
+  render_input_bar()
   if win_ok(S.input_win) then
     pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, 0 })
   end
@@ -4286,142 +4213,126 @@ end
 --  right: [↑]
 -- ── Footer status bar (OpenCode-style: working dir + context + tokens) ────
 render_footer = function()
-  if not win_ok(S.chat_win) then return end
-
-  local ok_f, _ = pcall(function()
-    local function chip(hl, text)
-      return '%#' .. hl .. '#' .. text:gsub('%%', '%%%%') .. '%*'
+  for _, win in ipairs({ S.chat_win, S.input_win, S.topbar_win }) do
+    if win ~= nil and vim.api.nvim_win_is_valid(win) then
+      pcall(vim.api.nvim_win_set_option, win, 'statusline', INVISIBLE_STL)
     end
-
-    local agent_name = (agents.active_name and agents.active_name()) or 'Code'
-    local streaming  = S.is_streaming
-
-    -- Left: cwd + project-instructions badge + tool-mode badge
-    local cwd = vim.fn.fnamemodify(vim.fn.getcwd(), ':~')
-    if #cwd > 35 then cwd = '…' .. cwd:sub(-33) end
-    local left = chip('AiFooterBg', '  ')
-      .. chip('AiFooterDir', cwd)
-
-    -- Active buffer chip (editor state awareness — Cursor-style)
-    local ed_state = S.editor_state
-      or editor_m.capture({ origin_buf = S.origin_buf })
-    local active_label = editor_m.short_label(ed_state)
-    if active_label then
-      left = left .. chip('AiFooterBg', '  ')
-        .. chip('AiFooterCtx', active_label)
-    end
-    local sel_label = editor_m.selection_label(ed_state)
-    if sel_label then
-      left = left .. chip('AiFooterBg', '  ')
-        .. chip('AiFooterCost', sel_label)
-    end
-
-    -- PANDAVIM.md / AGENTS.md / CLAUDE.md indicator
-    local project_file = system_m.get_project_file()
-    if project_file then
-      left = left .. chip('AiFooterBg', '  ')
-        .. chip('AiFooterCtx', project_file)
-    end
-
-    -- Tool-mode badge (only shown when non-default)
-    local effective_mode = tool_support.effective_mode(
-      config.get_provider(), config.get_model())
-    if effective_mode == 'react' then
-      left = left .. chip('AiFooterBg', '  ')
-        .. chip('AiFooterCost', 'ReAct')
-    elseif effective_mode == 'off' then
-      -- Prominent warning — "Tools OFF" is a footgun users often hit
-      -- accidentally via persisted config
-      left = left .. chip('AiFooterBg', '  ')
-        .. chip('AiFooterError', '⚠ Tools OFF')
-    end
-
-    -- Debug indicator
-    if config.get_debug_mode() then
-      left = left .. chip('AiFooterBg', '  ')
-        .. chip('AiFooterCost', 'DEBUG')
-    end
-
-    left = left .. chip('AiFooterBg', '  ')
-
-    -- Right: [spinner] + agent + @file + tokens
-    local parts = {}
-
-    if streaming then
-      local frame = SPINNER_FRAMES[S.spinner_frame] or '⣾'
-      table.insert(parts, chip('AiBarSpinner', frame))
-    end
-
-    table.insert(parts, chip('AiFooterCtx', agent_name))
-
-    local ctx_n = context.count and context.count() or 0
-    if ctx_n > 0 then
-      local ctx_label = ctx_n == 1 and (ctx_n .. ' file') or (ctx_n .. ' files')
-      table.insert(parts, chip('AiFooterCtx', ctx_label))
-    end
-
-    if S.token_total and S.token_total > 0 then
-      local tok_str = S.token_total >= 1000
-        and string.format('%.1fk', S.token_total / 1000)
-        or tostring(S.token_total)
-      table.insert(parts, chip('AiFooterToken', tok_str .. ' tokens'))
-    end
-
-    local right = table.concat(parts, chip('AiFooterBg', '  '))
-      .. chip('AiFooterBg', '  ')
-
-    vim.api.nvim_win_set_option(S.chat_win, 'statusline', left .. '%=' .. right)
-  end)
+  end
 end
 
 render_input_bar = function()
-  if not win_ok(S.input_win) then return end
+  if not win_ok(S.input_win) or not S.input_buf then return end
+  if not vim.api.nvim_buf_is_valid(S.input_buf) then return end
 
-  local model      = config.get_model()
-  local provider   = config.get_provider()
-  local short_m    = model:match('([^%-/]+)$') or model
-  if #short_m > 20 then short_m = short_m:sub(1, 18) .. '…' end
-  local agent_name = (agents.active_name and agents.active_name()) or 'Code'
+  sidebar_statusline_off()
   local streaming  = S.is_streaming
 
-  local function chip(hl, text)
-    return '%#' .. hl .. '#' .. text:gsub('%%', '%%%%') .. '%*'
-  end
+  -- Read ALL lines, then filter out the rendered bottom hint row.
+  local all_lines = vim.api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
+  local edit_lines = sanitize_input_lines(all_lines, true)
 
-  -- Keep the winbar mostly empty and push Windsurf-style controls into a
-  -- virtual footer line inside the input buffer.
-  local right
+  -- Build the hint row content
+  local hint_left, hint_right
   if streaming then
     local frame = SPINNER_FRAMES[S.spinner_frame] or '⣾'
-    right = chip('AiBarSpinner', frame)
-      .. chip('AiBarBg', '  ')
-      .. chip('AiBarModel', 'esc')
-      .. chip('AiBarBg', ' ')
-      .. chip('AiFooterToken', 'interrupt')
-      .. chip('AiBarBg', '  ')
+    hint_left = frame .. '  '
+    hint_right = 'esc interrupt'
   else
-    right = chip('AiBarSend', ' ↑ ')
-      .. chip('AiBarBg', '  ')
+    hint_left = 'enter submit'
+    hint_right = '@ file  ·  / command'
+  end
+  local gap = math.max(4, W - 5 - vim.fn.strdisplaywidth(hint_left) - vim.fn.strdisplaywidth(hint_right))
+  local hint_text = '  ' .. hint_left .. string.rep(' ', gap) .. hint_right
+
+  pcall(vim.api.nvim_buf_set_option, S.input_buf, 'modifiable', true)
+
+  -- Boxed composer: editable lines first, then a bottom hint row.
+  local new_lines = {}
+  for _, l in ipairs(edit_lines) do table.insert(new_lines, l) end
+  -- Ensure at least one editable line so the placeholder has somewhere to sit
+  if #new_lines == 0 then table.insert(new_lines, '') end
+  table.insert(new_lines, hint_text)
+
+  local total_lines = #new_lines
+  local editable_count = total_lines - 1
+
+  -- Write back — grows or shrinks the buffer to fit content
+  vim.api.nvim_buf_set_lines(S.input_buf, 0, -1, false, new_lines)
+
+  -- Highlight the boxed prompt shell and hint row.
+  local render_ns = vim.api.nvim_create_namespace('AiInputBorderNS')
+  vim.api.nvim_buf_clear_namespace(S.input_buf, render_ns, 0, -1)
+  vim.api.nvim_buf_set_extmark(S.input_buf, render_ns, 0, 0, {
+    end_row = editable_count, hl_group = 'AiInputBg',
+  })
+  vim.api.nvim_buf_set_extmark(S.input_buf, render_ns, editable_count, 0, {
+    end_row = total_lines, hl_group = 'AiInputBorderBar',
+  })
+
+  -- Placeholder overlay on first editable line when empty
+  local placeholder_ns = vim.api.nvim_create_namespace('AiInputPlaceholderNS')
+  vim.api.nvim_buf_clear_namespace(S.input_buf, placeholder_ns, 0, -1)
+  if vim.trim(table.concat(edit_lines, '\n')) == '' then
+    vim.api.nvim_buf_set_extmark(S.input_buf, placeholder_ns, 0, 0, {
+      virt_text = { { 'Ask anything...', 'AiInputPlaceholder' } },
+      virt_text_pos = 'overlay',
+      hl_mode = 'combine',
+    })
   end
 
-  pcall(vim.api.nvim_win_set_option, S.input_win, 'winbar', chip('AiBarBg', '  ') .. '%=' .. right)
+  -- Left colored border via signcolumn on ALL editable lines
+  vim.fn.sign_unplace('AiInputBorderGrp', { buffer = S.input_buf })
+  for i = 1, editable_count do
+    pcall(vim.fn.sign_place, 0, 'AiInputBorderGrp', 'AiInputBorderSign', S.input_buf, { lnum = i })
+  end
+end
 
-  local footer_ns = vim.api.nvim_create_namespace('AiInputFooter')
-  local cwd = vim.fn.fnamemodify(vim.fn.getcwd(), ':t')
-  local footer_chunks = {
-    { '  +', 'AiBadgeAttach' },
-    { '  <> ' .. agent_name, 'AiBadgeChip' },
-    { '  ' .. short_m, 'AiBadgeModel' },
-    { string.rep(' ', math.max(1, W - 18 - vim.fn.strdisplaywidth(agent_name) - vim.fn.strdisplaywidth(short_m) - vim.fn.strdisplaywidth(cwd))), 'AiInputBg' },
-    { '📁 ' .. cwd, 'AiBadgeScope' },
-    { '  ⬆', 'AiBadgeSend' },
-  }
-  vim.api.nvim_buf_clear_namespace(S.input_buf, footer_ns, 0, -1)
-  local row = math.max(0, vim.api.nvim_buf_line_count(S.input_buf) - 1)
-  vim.api.nvim_buf_set_extmark(S.input_buf, footer_ns, row, 0, {
-    virt_lines = { footer_chunks },
-    virt_lines_above = false,
-  })
+-- Lightweight placeholder sync: called on every keystroke so the overlay
+-- disappears immediately when the user starts typing.
+local function update_input_placeholder()
+  if not S.input_buf or not vim.api.nvim_buf_is_valid(S.input_buf) then return end
+  local placeholder_ns = vim.api.nvim_create_namespace('AiInputPlaceholderNS')
+  vim.api.nvim_buf_clear_namespace(S.input_buf, placeholder_ns, 0, -1)
+  local lines = vim.api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
+  lines = sanitize_input_lines(lines, true)
+  if vim.trim(table.concat(lines, '\n')) == '' then
+    vim.api.nvim_buf_set_extmark(S.input_buf, placeholder_ns, 0, 0, {
+      virt_text = { { 'Ask anything...', 'AiInputPlaceholder' } },
+      virt_text_pos = 'overlay',
+      hl_mode = 'combine',
+    })
+  end
+end
+
+local input_repair_pending = false
+local function repair_input_hint_row()
+  if input_repair_pending then return end
+  if not S.input_buf or not vim.api.nvim_buf_is_valid(S.input_buf) then return end
+  if not win_ok(S.input_win) then return end
+
+  local total = vim.api.nvim_buf_line_count(S.input_buf)
+  if total <= 1 then return end
+
+  local cur = vim.api.nvim_win_get_cursor(S.input_win)
+  local last_editable = math.max(1, total - 1)
+  local hint = vim.api.nvim_buf_get_lines(S.input_buf, total - 1, total, false)[1] or ''
+  local hint_changed = not (hint:match('enter submit') or hint:match('esc interrupt'))
+
+  if cur[1] <= last_editable and not hint_changed then return end
+
+  input_repair_pending = true
+  vim.schedule(function()
+    input_repair_pending = false
+    if not S.input_buf or not vim.api.nvim_buf_is_valid(S.input_buf) then return end
+    if not win_ok(S.input_win) then return end
+
+    local row = math.min(cur[1], math.max(1, vim.api.nvim_buf_line_count(S.input_buf) - 1))
+    render_input_bar()
+    local line = vim.api.nvim_buf_get_lines(S.input_buf, row - 1, row, false)[1] or ''
+    pcall(vim.api.nvim_win_set_cursor, S.input_win, { row, math.min(cur[2], #line) })
+    if vim.api.nvim_get_mode().mode ~= 'i' then return end
+    vim.cmd('startinsert')
+  end)
 end
 
 -- ── Session helpers ───────────────────────────────────────────────────────
@@ -4526,10 +4437,7 @@ local function focus_for_picker()
 end
 
 refocus_input = function()
-  if win_ok(S.input_win) then
-    vim.api.nvim_set_current_win(S.input_win)
-    vim.cmd('startinsert')
-  end
+  focus_input_preserve_cursor(true)
 end
 
 -- helper used by several commands to do a full redraw after state change
@@ -4902,9 +4810,9 @@ CMDS = {
         callback = function()
           local lines = vim.api.nvim_buf_get_lines(scratch, 0, -1, false)
           local text  = vim.trim(table.concat(lines, '\n'))
-          if text ~= '' and S.input_buf and vim.api.nvim_buf_is_valid(S.input_buf) then
+            if text ~= '' and S.input_buf and vim.api.nvim_buf_is_valid(S.input_buf) then
             pcall(vim.api.nvim_buf_set_option, S.input_buf, 'modifiable', true)
-            vim.api.nvim_buf_set_lines(S.input_buf, 0, -1, false,
+            vim.api.nvim_buf_set_lines(S.input_buf, 1, INPUT_H - 1, false,
               vim.split(text, '\n', { plain = true }))
           end
           vim.schedule(refocus_input)
@@ -5234,8 +5142,9 @@ local function submit()
       -- Only reclaim focus if we're still inside a sidebar window
       -- (picker floats have relative='editor' so they won't be a sidebar win)
       local cw = vim.api.nvim_get_current_win()
-      if is_sidebar_win(cw) and win_ok(S.input_win) then
+       if is_sidebar_win(cw) and win_ok(S.input_win) then
         vim.api.nvim_set_current_win(S.input_win)
+        pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, 0 })
         vim.cmd('startinsert')
       end
     end)
@@ -5498,6 +5407,7 @@ local function setup_input_keymaps(slash, at)
       vim.schedule(function()
         if win_ok(S.input_win) then
           vim.api.nvim_set_current_win(S.input_win)
+          pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, 0 })
           vim.cmd('startinsert')
         end
       end)
@@ -5579,9 +5489,11 @@ local function setup_input_keymaps(slash, at)
       return
     end
     local lines = vim.split(S.input_history[S.history_idx], '\n', { plain = true })
+    lines = sanitize_input_lines(lines)
     pcall(vim.api.nvim_buf_set_option, buf, 'modifiable', true)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, #lines[1] })
+    vim.api.nvim_buf_set_lines(buf, 0, INPUT_H - 1, false, lines)
+    render_input_bar()
+    pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, lines[1] and #lines[1] or 0 })
   end
   local function history_forward()
     if S.history_idx == 0 then return end
@@ -5589,16 +5501,20 @@ local function setup_input_keymaps(slash, at)
       -- Restore the draft the user was typing before they entered history mode.
       S.history_idx = 0
       local lines = vim.split(S.history_draft or '', '\n', { plain = true })
+      lines = sanitize_input_lines(lines)
       pcall(vim.api.nvim_buf_set_option, buf, 'modifiable', true)
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      vim.api.nvim_buf_set_lines(buf, 0, INPUT_H - 1, false, lines)
+      render_input_bar()
       pcall(vim.api.nvim_win_set_cursor, S.input_win,
-        { #lines, lines[#lines] and #lines[#lines] or 0 })
+        { 1, lines[1] and #lines[1] or 0 })
     else
       S.history_idx = S.history_idx + 1
       local lines = vim.split(S.input_history[S.history_idx], '\n', { plain = true })
+      lines = sanitize_input_lines(lines)
       pcall(vim.api.nvim_buf_set_option, buf, 'modifiable', true)
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-      pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, #lines[1] })
+      vim.api.nvim_buf_set_lines(buf, 0, INPUT_H - 1, false, lines)
+      render_input_bar()
+      pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, lines[1] and #lines[1] or 0 })
     end
   end
 
@@ -5660,6 +5576,7 @@ local function setup_input_keymaps(slash, at)
   vim.keymap.set({ 'i', 'n' }, '<C-a>', function()
     if win_ok(S.input_win) then
       vim.api.nvim_set_current_win(S.input_win)
+      pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, 0 })
       if vim.api.nvim_get_mode().mode ~= 'i' then vim.cmd('startinsert') end
       local keys = vim.api.nvim_replace_termcodes('@', true, false, true)
       vim.api.nvim_feedkeys(keys, 'n', false)
@@ -5676,11 +5593,7 @@ local function setup_input_keymaps(slash, at)
     process_slash_command('/agents')
   end, e{ desc = 'AI: agents' })
 
-  vim.api.nvim_buf_set_option(buf, 'omnifunc', '')
-
-  -- Disable nvim-cmp in the AI input buffer entirely
-  local ok_cmp, cmp = pcall(require, 'cmp')
-  if ok_cmp then cmp.setup.buffer({ enabled = false }) end
+  disable_input_integrations(buf)
 end
 
 function M.complete_slash(findstart, base)
@@ -5836,10 +5749,13 @@ local function setup_slash_complete()
     float.win        = nil
     float.buf        = nil
   end
+  S.slash_float_close = close_float
 
   local function open_float(items)
     if float.visible then return end
     if #items == 0 then return end
+    -- Mutual exclusion: close @ file float if open
+    if S.at_float_close then S.at_float_close() end
     float.items      = items
     float.selection  = 1
     float.scroll_top = 1
@@ -5928,7 +5844,8 @@ local function setup_slash_complete()
     group  = augroup,
     buffer = buf,
     callback = function()
-      local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ''
+      local row = active_input_row()
+      local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ''
       if not line:match('^/') then close_float(); return end
       local query = line:match('^/(%S*)$') or ''
       local items = matching(query)
@@ -5957,36 +5874,29 @@ local function setup_slash_complete()
   -- <C-n>/<C-p>/<C-j>/<C-k>/<ScrollWheel{Up,Down}> bindings here, but those
   -- collided with the @-float's identically-named bindings (whichever
   -- setup_*_complete ran SECOND silently won, breaking nav for the first).
-  -- All shared nav keys are now dispatched from setup_input_keymaps via the
-  -- exposed `up` / `down` functions on the returned table. We only keep the
-  -- bindings that have NO equivalent in the @-float. Today that's nothing —
-  -- everything moved out. Left as a single explanatory comment so future
-  -- contributors don't re-add a binding here without considering the conflict.
-  local bopt = { buffer = buf, noremap = true, silent = true, nowait = true }
-  local _ = bopt  -- referenced by setup_input_keymaps via the return table
+  -- ── Cursor constraint: keep cursor on editable lines only.
+  -- The last buffer line is always the hint row; everything above it is editable.
+  vim.api.nvim_create_autocmd({ 'CursorMoved', 'CursorMovedI' }, {
+    buffer = buf,
+    callback = function()
+      if not S.input_buf or not vim.api.nvim_buf_is_valid(S.input_buf) then return end
+      local total = vim.api.nvim_buf_line_count(S.input_buf)
+      local last_editable = math.max(1, total - 1)
+      local cur_row = vim.api.nvim_win_get_cursor(S.input_win)[1]
+      if cur_row < 1 then
+        pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, 0 })
+      elseif cur_row > last_editable then
+        pcall(vim.api.nvim_win_set_cursor, S.input_win, { last_editable, 0 })
+      end
+    end,
+  })
 
-  -- C-n / C-p
-  vim.keymap.set('i', '<C-n>', function()
-    if float.visible then down() end
-  end, bopt)
-  vim.keymap.set('i', '<C-p>', function()
-    if float.visible then up() end
-  end, bopt)
-
-  -- Esc: close float
-  vim.keymap.set('i', '<Esc>', function()
-    if float.visible then close_float() end
-  end, bopt)
+  disable_input_integrations(buf)
 
   return {
     visible = function() return float.visible end,
     select  = select_item,
     close   = close_float,
-    -- Exposed so setup_input_keymaps can dispatch unified <Up>/<Down>/
-    -- <C-n>/<C-p>/<S-Tab>/wheel handlers without conflicting with the
-    -- @-float's bindings. The setup_*_complete functions used to bind
-    -- these keys themselves, but whichever was registered LAST won —
-    -- silently breaking nav for the other.
     up      = up,
     down    = down,
   }
@@ -6173,9 +6083,12 @@ local function setup_at_complete()
     float.win         = nil
     float.buf         = nil
   end
+  S.at_float_close = close_float
 
   local function open_float(items, height)
     if float.visible then return end
+    -- Mutual exclusion: close slash command float if open
+    if S.slash_float_close then S.slash_float_close() end
     float.items     = items
     float.selection = 1
 
@@ -6225,9 +6138,10 @@ local function setup_at_complete()
     if float.selection < 1 or float.selection > #float.items then return end
     local selected = float.items[float.selection]
     local tc = float.trigger_col  -- 0-indexed column of '@'
+    local row = active_input_row()
     close_float()
 
-    local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ''
+    local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ''
     local before = line:sub(1, tc)  -- everything BEFORE the '@'
     local after  = line:match('@%S*(.*)', tc + 1) or ''
 
@@ -6243,8 +6157,8 @@ local function setup_at_complete()
 
     local new_line = before .. insert .. vim.trim(after)
     pcall(vim.api.nvim_buf_set_option, buf, 'modifiable', true)
-    vim.api.nvim_buf_set_lines(buf, 0, 1, false, { new_line })
-    pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, #before + #insert })
+    vim.api.nvim_buf_set_lines(buf, row - 1, row, false, { new_line })
+    pcall(vim.api.nvim_win_set_cursor, S.input_win, { row, #before + #insert })
 
     -- Attach file to context only for real files. The chip visual lives
     -- inside the user bubble at submit time (see append_user), NOT as a
@@ -6301,7 +6215,8 @@ local function setup_at_complete()
     group  = augroup,
     buffer = buf,
     callback = function()
-      local line   = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ''
+      local row = active_input_row()
+      local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ''
       -- Skip if this is a slash command (avoid expensive file scan)
       if line:match('^/') then
         if float.visible then close_float() end
@@ -6400,6 +6315,7 @@ local function setup_chat_keymaps()
   vim.keymap.set('n', '<Tab>', function()
     if win_ok(S.input_win) then
       vim.api.nvim_set_current_win(S.input_win)
+      pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, 0 })
       vim.cmd('startinsert')
     end
   end, e{ desc = 'AI: focus input' })
@@ -6419,34 +6335,6 @@ local function setup_chat_keymaps()
     end
     ToolCard.set_expanded(card_id, not ToolCard.is_expanded(card_id))
   end, e{ desc = 'AI: expand/collapse tool card' })
-
-  -- Change A: per-message toolbar keymaps (dispatch to message under cursor).
-  -- These only do anything when the cursor is on a row associated with an
-  -- assistant message that has a toolbar; otherwise they fall through silently.
-  local function msg_at_cursor()
-    local row = vim.api.nvim_win_get_cursor(S.chat_win)[1] - 1
-    return find_msg_at(row)
-  end
-  vim.keymap.set('n', 'y', function()
-    local idx = msg_at_cursor()
-    if idx then M._msg_copy(idx) else toast('No message here', 'warn') end
-  end, e{ desc = 'AI: copy message at cursor' })
-  vim.keymap.set('n', 'r', function()
-    local idx = msg_at_cursor()
-    if idx then M._msg_regenerate(idx) end
-  end, e{ desc = 'AI: regenerate from cursor' })
-  vim.keymap.set('n', 'u', function()
-    local idx = msg_at_cursor()
-    if idx then M._msg_feedback(idx, 'up') end
-  end, e{ desc = 'AI: 👍 message' })
-  vim.keymap.set('n', 'i', function()
-    local idx = msg_at_cursor()
-    if idx then M._msg_feedback(idx, 'down') end
-  end, e{ desc = 'AI: 👎 message' })
-  vim.keymap.set('n', 'o', function()
-    local idx = msg_at_cursor()
-    if idx then M._msg_open_scratch(idx) end
-  end, e{ desc = 'AI: open message in scratch buffer' })
 
   -- scroll — j/k/gg unpin sticky-scroll; G repins and jumps to bottom
   vim.keymap.set('n', 'j', function()
@@ -6475,26 +6363,21 @@ local function setup_chat_keymaps()
   end, e{})
 
   -- ── [[ / ]] — jump between messages ───────────────────────────────────────
-  -- Scans buffer for assistant sparkle lines ("  ✦") and user bubble starts
-  -- (right-padded text after a blank line).
-  local user_pad_threshold = math.floor(W / 3)
-
+  -- Scans buffer for assistant meta lines ("   Code · provider · model") and
+  -- user bubble border lines ("   ┃ ...") to find message boundaries.
   local function find_message_starts()
     if not S.chat_buf or not vim.api.nvim_buf_is_valid(S.chat_buf) then return {} end
     local lines = vim.api.nvim_buf_get_lines(S.chat_buf, 0, -1, false)
     local starts = {}
     for i, line in ipairs(lines) do
-      -- Assistant message: sparkle prefix
-      if line:match('^  ✦') then
+      -- Assistant message: meta line with 3-space indent and '·' separator
+      if line:match('^   .- · .-$') or line:match('^   ●') then
         table.insert(starts, i - 1)  -- 0-indexed
-      elseif #line > 0 then
-        -- User message: lots of leading whitespace after a blank or timestamp line
-        local leading = #(line:match('^(%s*)') or '')
-        if leading >= user_pad_threshold then
-          local prev = (i > 1) and lines[i - 1] or ''
-          if prev == '' or prev:match('^%s*$') then
-            table.insert(starts, i - 1)
-          end
+      elseif line:match('^%s*┃') then
+        -- User message: first border-prefixed line after a blank line
+        local prev = (i > 1) and lines[i - 1] or ''
+        if prev == '' or prev:match('^%s*$') then
+          table.insert(starts, i - 1)
         end
       end
     end
@@ -6550,7 +6433,10 @@ local function setup_chat_keymaps()
         for sj = 1, si do
           local row = starts[sj]
           local line = vim.api.nvim_buf_get_lines(S.chat_buf, row, row + 1, false)[1] or ''
-          if not line:match('^  ✦') then count = count + 1 end  -- user message
+          -- Assistant meta lines have '·' or '●' after 3-space indent
+          if not (line:match('^   .- · .-$') or line:match('^   ●')) then
+            count = count + 1  -- user message
+          end
         end
         -- map count back to S.messages index (user messages)
         local user_count = 0
@@ -6596,11 +6482,15 @@ local function apply_cosmetics(win)
     signcolumn     = 'no',  foldcolumn     = '0',
     wrap           = true,  linebreak      = true,
     cursorline     = false,
-    statusline     = ' ',   -- blank statusline = invisible divider bar
+    cursorcolumn   = false,
+    colorcolumn    = '',
+    statusline     = INVISIBLE_STL,
+    winbar         = '',
     spell          = false,
     list           = false,
     showbreak      = '   ',
-    fillchars      = 'eob: ',  -- hide ~ end-of-buffer markers
+    -- Blank split glyphs locally so separator columns blend into the pane.
+    fillchars      = 'eob: ,vert: ,horiz: ,horizup: ,horizdown: ,vertleft: ,vertright: ',
   }
   for k, v in pairs(opts) do
     pcall(vim.api.nvim_win_set_option, win, k, v)
@@ -6612,16 +6502,17 @@ end
 -- Layout (all real splits, no floats):
 --
 --   ┌─────────────────────────┐
---   │  topbar  (TOPBAR_H=2)   │  ← winfixheight, no statusline
---   ├─────────────────────────┤
 --   │                         │
 --   │  chat                   │  ← scrollable, welcome / messages
 --   │                         │
 --   ├─────────────────────────┤
---   │  input   (INPUT_H)      │  ← winfixheight, editable
+--   │  agent · model provider │  ← line 1, metadata (render_input_bar)
+--   │  ┃ editable area        │  ← lines 2..INPUT_H-1, user types here
+--   │  enter submit  / cmd    │  ← line INPUT_H, hint (render_input_bar)
 --   └─────────────────────────┘
 --
 local function open_sidebar()
+  sidebar_statusline_off()
   if vim.o.columns < MIN_COLS then
     vim.notify(
       string.format('PandaVim AI: terminal too narrow (%d < %d cols)', vim.o.columns, MIN_COLS),
@@ -6643,7 +6534,7 @@ local function open_sidebar()
 
   local w = math.min(W, vim.o.columns - 24)
 
-  -- ── 1. Chat split (right column, full height initially) ──────────────────
+  -- ── 1. Header split (top of sidebar column) ──────────────────────────────
   S.chat_buf = make_buf('AI:chat', false, 'AiChat')
   local ok_win, chat_win = pcall(vim.api.nvim_open_win, S.chat_buf, false, {
     split = 'right',
@@ -6659,82 +6550,67 @@ local function open_sidebar()
   -- Must happen BEFORE any run_tool_loop call renders a card.
   ToolCard.setup({ bufnr = S.chat_buf, ns = NS_CHAT })
   apply_cosmetics(S.chat_win)
+  -- Winbar separator creates a fixed horizontal rule between header and chat
+  vim.api.nvim_win_set_option(S.chat_win, 'winbar', string.rep('─', w))
   vim.api.nvim_win_set_option(S.chat_win, 'winhighlight',
-    'Normal:AiChatBg,NormalNC:AiChatBg,SignColumn:AiChatBg,EndOfBuffer:AiChatBg,StatusLine:AiChatBg,StatusLineNC:AiChatBg')
+    'Normal:AiChatBg,NormalNC:AiChatBg,SignColumn:AiChatBg,EndOfBuffer:AiChatBg,StatusLine:AiChatBg,StatusLineNC:AiChatBg,Separator:AiChatBg,VertSplit:AiChatBg,WinSeparator:AiChatBg,WinBar:AiChatSep,WinBarNC:AiChatSep')
   vim.api.nvim_win_set_option(S.chat_win, 'scrolloff', 3)
   -- Smooth scrolling (Neovim 0.10+)
   pcall(vim.api.nvim_win_set_option, S.chat_win, 'smoothscroll', true)
 
-  -- ── 2. Topbar split (above chat, fixed height) ────────────────────────────
-  S.topbar_buf = make_buf('AI:topbar', false, 'AiTopbar')
-  S.topbar_win = vim.api.nvim_open_win(S.topbar_buf, false, {
-    split  = 'above',
-    win    = S.chat_win,
-    height = TOPBAR_H,
-  })
-  vim.api.nvim_win_set_option(S.topbar_win, 'winfixheight', true)
-  vim.api.nvim_win_set_option(S.topbar_win, 'winfixwidth',  true)
-  apply_cosmetics(S.topbar_win)
-  vim.api.nvim_win_set_option(S.topbar_win, 'winhighlight',
-    'Normal:AiTopBg,NormalNC:AiTopBg,SignColumn:AiTopBg,EndOfBuffer:AiTopBg,StatusLine:AiTopBg,StatusLineNC:AiTopBg')
-
-  -- ── 3. Input split (below chat, fixed height) ─────────────────────────────
+  -- ── 2. Input split
   S.input_buf = make_buf('AI:input', true, 'AiInput')
   S.input_win = vim.api.nvim_open_win(S.input_buf, false, {
     split  = 'below',
     win    = S.chat_win,
     height = INPUT_H,
   })
-  vim.api.nvim_win_set_option(S.input_win, 'winfixheight', true)
-  vim.api.nvim_win_set_option(S.input_win, 'winfixwidth',  true)
+  -- winfixheight removed so composer can grow with multi-line input
+  -- winfixwidth removed so sidebar can be resized horizontally
   apply_cosmetics(S.input_win)
   vim.api.nvim_win_set_option(S.input_win, 'winhighlight',
-    'Normal:AiInputBg,NormalNC:AiInputBg,CursorLine:AiInputBg,EndOfBuffer:AiInputBg,StatusLine:AiInputBg,StatusLineNC:AiInputBg,SignColumn:AiInputBorder')
+    'Normal:AiInputBg,NormalNC:AiInputBg,CursorLine:AiInputBg,EndOfBuffer:AiInputBg,StatusLine:AiInputBg,StatusLineNC:AiInputBg,SignColumn:AiInputBg,Separator:AiChatBg,VertSplit:AiChatBg,WinSeparator:AiChatBg,WinBar:AiInputBg,WinBarNC:AiInputBg'
+  )
+  -- No wrapping in composer: long lines scroll horizontally instead of
+  -- wrapping with an ugly showbreak indicator.
+  vim.api.nvim_win_set_option(S.input_win, 'wrap', false)
+  vim.api.nvim_win_set_option(S.input_win, 'showbreak', '')
+  vim.api.nvim_win_set_option(S.input_win, 'linebreak', false)
   -- Left colored border via signcolumn (OpenCode-style ┃ agent border)
+  -- Only on editable lines, not the bottom hint row.
   vim.api.nvim_win_set_option(S.input_win, 'signcolumn', 'yes:1')
   vim.fn.sign_define('AiInputBorderSign', { text = '┃', texthl = 'AiInputBorder' })
-  -- Place sign on every line (will be refreshed as needed)
-  for i = 1, INPUT_H do
-    pcall(vim.fn.sign_place, 0, 'AiInputBorderGrp', 'AiInputBorderSign', S.input_buf, { lnum = i })
-  end
+  disable_input_integrations(S.input_buf)
 
-  -- ── 4. Initial content ────────────────────────────────────────────────────
-  render_topbar()
+  -- ── 3. Header split (top of sidebar column) ──────────────────────────────
+  S.topbar_buf = make_buf('AI:header', false, 'AiTopbar')
+  S.topbar_win = vim.api.nvim_open_win(S.topbar_buf, false, {
+    split = 'above',
+    win = S.chat_win,
+    height = TOPBAR_H,
+  })
+  apply_cosmetics(S.topbar_win)
+  vim.api.nvim_win_set_option(S.topbar_win, 'winfixheight', true)
+  -- winfixwidth removed so sidebar can be resized horizontally
+  vim.api.nvim_win_set_option(S.topbar_win, 'winhighlight',
+    'Normal:AiTopBg,NormalNC:AiTopBg,EndOfBuffer:AiTopBg,StatusLine:AiTopBg,StatusLineNC:AiTopBg,Separator:AiChatBg,VertSplit:AiChatBg,WinSeparator:AiChatBg,WinBar:AiTopBg,WinBarNC:AiTopBg'
+  )
+
+  -- Aggressive second pass: some plugins reset laststatus/ruler on WinNew.
+  sidebar_statusline_off()
+
+  -- ── 3. Initial content ────────────────────────────────────────────────────
   vim.schedule(function()
-    if S.is_open then render_welcome() end
+    if S.is_open then
+      pcall(render_welcome)
+    end
   end)
-  render_input_bar()
+  pcall(render_topbar)
+  pcall(render_input_bar)
   render_footer()
   setup_topbar_keymaps()
   setup_chat_keymaps()
   setup_input_keymaps(setup_slash_complete(), setup_at_complete())
-
-  -- Placeholder text in input (OpenCode: "Ask anything..." with rotating examples)
-  local placeholder_ns = vim.api.nvim_create_namespace('AiInputPlaceholder')
-  local placeholders = {
-    'Fix a TODO in the codebase',
-    'Explain how this function works',
-    'Write a unit test',
-    'Refactor this code',
-    'Help me debug this error',
-  }
-  local placeholder_idx = math.random(1, #placeholders)
-  local function update_input_placeholder()
-    vim.api.nvim_buf_clear_namespace(S.input_buf, placeholder_ns, 0, -1)
-    local lines = vim.api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
-    local text = table.concat(lines, '\n')
-    if vim.trim(text) == '' then
-      pcall(vim.api.nvim_buf_set_extmark, S.input_buf, placeholder_ns, 0, 0, {
-        virt_text = { { 'Ask anything... "' .. placeholders[placeholder_idx] .. '"', 'AiInputPlaceholder' } },
-        virt_text_pos = 'overlay',
-      })
-    end
-  end
-  update_input_placeholder()
-  vim.api.nvim_create_autocmd({ 'TextChangedI', 'TextChanged', 'InsertLeave', 'InsertEnter' }, {
-    buffer = S.input_buf,
-    callback = update_input_placeholder,
-  })
 
   -- Live highlight for @filename tokens in the input buffer.
   -- Gives the user visual feedback that the token will be attached on submit,
@@ -6743,8 +6619,11 @@ local function open_sidebar()
   local function update_at_mentions()
     if not S.input_buf or not vim.api.nvim_buf_is_valid(S.input_buf) then return end
     vim.api.nvim_buf_clear_namespace(S.input_buf, at_mention_ns, 0, -1)
-    local lines = vim.api.nvim_buf_get_lines(S.input_buf, 0, -1, false)
-    for row, line in ipairs(lines) do
+    -- Scan all lines except the last (hint row)
+    local total = vim.api.nvim_buf_line_count(S.input_buf)
+    local lines = vim.api.nvim_buf_get_lines(S.input_buf, 0, math.max(1, total - 1), false)
+    for idx, line in ipairs(lines) do
+      local row = idx - 1 -- 0-based line number in buffer
       -- Scan the line for `@<nonspace>+` tokens. The opening `@` must be
       -- either at line start or preceded by whitespace so we don't match
       -- mid-word substrings (e.g. `user@host` shouldn't highlight `@host`).
@@ -6755,7 +6634,7 @@ local function open_sidebar()
         local before = s > 1 and line:sub(s - 1, s - 1) or ''
         if before == '' or before == ' ' or before == '\t' then
           pcall(vim.api.nvim_buf_set_extmark, S.input_buf, at_mention_ns,
-            row - 1, s - 1, {
+            row, s - 1, {
               end_col  = e,
               hl_group = 'AiAtFile',  -- reuse the picker's accent color
             })
@@ -6767,13 +6646,33 @@ local function open_sidebar()
   update_at_mentions()
   vim.api.nvim_create_autocmd({ 'TextChangedI', 'TextChanged' }, {
     buffer   = S.input_buf,
-    callback = update_at_mentions,
+    callback = function()
+      repair_input_hint_row()
+      update_at_mentions()
+    end,
   })
+  vim.api.nvim_create_autocmd({ 'TextChangedI', 'TextChanged' }, {
+    buffer   = S.input_buf,
+    callback = function()
+      repair_input_hint_row()
+      update_input_placeholder()
+    end,
+  })
+  vim.api.nvim_create_autocmd({ 'InsertEnter', 'FileType' }, {
+    buffer = S.input_buf,
+    callback = function() disable_input_integrations(S.input_buf) end,
+  })
+
+  -- Composer height is fixed at INPUT_H (12 lines) — no auto-resize.
+  -- This avoids fragile split-layout resizing while giving ample room
+  -- for multi-line messages. The buffer can hold more lines; the user
+  -- scrolls within the composer if needed.
 
   S.is_open = true
 
   -- ── 5. Focus input ────────────────────────────────────────────────────────
   vim.api.nvim_set_current_win(S.input_win)
+  pcall(vim.api.nvim_win_set_cursor, S.input_win, { 1, 0 })
   vim.cmd('startinsert')
 
   -- ── 6. Autocmds ───────────────────────────────────────────────────────────
@@ -6783,7 +6682,16 @@ local function open_sidebar()
     group = S.win_augroup,
     callback = function()
       local ww = vim.api.nvim_get_current_win()
-      if not is_sidebar_win(ww) then S.last_editor_win = ww end
+      if not is_sidebar_win(ww) then
+        S.last_editor_win = ww
+        return
+      end
+      -- Re-apply invisible statusline every time focus enters a sidebar
+      -- window — some plugins reset it asynchronously.
+      pcall(vim.api.nvim_win_set_option, ww, 'statusline', INVISIBLE_STL)
+      if vim.o.laststatus ~= 0 then
+        vim.o.laststatus = 0
+      end
     end,
   })
 
@@ -6791,7 +6699,7 @@ local function open_sidebar()
     group = S.win_augroup,
     callback = function(ev)
       local closed = tonumber(ev.match)
-      if closed == S.chat_win or closed == S.input_win or closed == S.topbar_win then
+      if closed == S.chat_win or closed == S.input_win then
         vim.schedule(function() M.close() end)
       end
     end,
@@ -6824,13 +6732,46 @@ local function open_sidebar()
       if not S.is_open then return end
       local new_w = math.min(W, vim.o.columns - 24)
       pcall(vim.api.nvim_win_set_width, S.chat_win,   new_w)
-      pcall(vim.api.nvim_win_set_width, S.topbar_win, new_w)
       pcall(vim.api.nvim_win_set_width, S.input_win,  new_w)
-      render_topbar()
       render_input_bar()
       if S.showing_welcome then render_welcome() end
     end,
   })
+
+  -- Guard: if a plugin (e.g. lualine) resets laststatus while sidebar is open,
+  -- force it back to 0 immediately and wipe statusline content on all panes.
+  vim.api.nvim_create_autocmd('OptionSet', {
+    group = S.win_augroup,
+    pattern = 'laststatus',
+    callback = function()
+      if not S.is_open then return end
+      if vim.o.laststatus ~= 0 then
+        vim.o.laststatus = 0
+        sidebar_statusline_off()
+      end
+    end,
+  })
+
+  -- Nuclear option: some plugins reset laststatus asynchronously on a timer.
+  -- Poll continuously while sidebar is open and clamp it back to 0.
+  local poll_timer = vim.loop.new_timer()
+  poll_timer:start(50, 200, vim.schedule_wrap(function()
+    if not S.is_open then
+      pcall(function() poll_timer:stop(); poll_timer:close() end)
+      return
+    end
+    if vim.o.laststatus ~= 0 then
+      vim.o.laststatus = 0
+    end
+    for _, win in ipairs({ S.chat_win, S.input_win, S.topbar_win }) do
+      if win ~= nil and vim.api.nvim_win_is_valid(win) then
+        local ok, stl = pcall(vim.api.nvim_win_get_option, win, 'statusline')
+        if not ok or stl ~= INVISIBLE_STL then
+          pcall(vim.api.nvim_win_set_option, win, 'statusline', INVISIBLE_STL)
+        end
+      end
+    end
+  end))
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -6853,11 +6794,11 @@ function M.focus_editor()
 end
 
 function M.focus_input()
-  if not S.is_open then M.open() end
-  if win_ok(S.input_win) then
-    vim.api.nvim_set_current_win(S.input_win)
-    vim.cmd('startinsert')
+  if config.get_ui_mode and config.get_ui_mode() == 'terminal' then
+    return require('ai.terminal').focus()
   end
+  if not S.is_open then M.open() end
+  focus_input_preserve_cursor(true)
 end
 
 function M.get_last_assistant_text()
@@ -6892,31 +6833,41 @@ function M.cancel_stream()
 end
 
 function M.close()
+  if config.get_ui_mode and config.get_ui_mode() == 'terminal' then
+    return require('ai.terminal').close()
+  end
   if not S.is_open then return end
   stop_spinner()
   if #S.messages > 0 then session_save() end
   S.is_open = false
   pcall(vim.api.nvim_del_augroup_by_name, 'AiSidebar')
-  for _, wid in ipairs({ S.topbar_win, S.input_win, S.chat_win }) do
+  for _, wid in ipairs({ S.input_win, S.chat_win, S.topbar_win }) do
     if win_ok(wid) then pcall(vim.api.nvim_win_close, wid, true) end
   end
-  for _, bid in ipairs({ S.topbar_buf, S.input_buf, S.chat_buf }) do
+  for _, bid in ipairs({ S.input_buf, S.chat_buf }) do
     if bid and vim.api.nvim_buf_is_valid(bid) then
       pcall(vim.api.nvim_buf_delete, bid, { force = true })
     end
   end
   S.chat_win   = nil; S.chat_buf   = nil
   S.input_win  = nil; S.input_buf  = nil
-  S.topbar_win = nil; S.topbar_buf = nil
   S.stream_line = nil; S.is_streaming = false
+  S.topbar_win = nil; S.topbar_buf = nil
+  sidebar_statusline_restore()
 end
 
 function M.open()
+  if config.get_ui_mode and config.get_ui_mode() == 'terminal' then
+    return require('ai.terminal').open()
+  end
   if S.is_open then return end
   open_sidebar()
 end
 
 function M.toggle()
+  if config.get_ui_mode and config.get_ui_mode() == 'terminal' then
+    return require('ai.terminal').toggle()
+  end
   if S.is_open then
     M.close()
     M.focus_editor()

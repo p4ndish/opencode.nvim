@@ -49,6 +49,8 @@ local default_config = {
   show_timestamps = true,
   debug_mode      = false,  -- /debug toggle — writes API traffic to log
   tool_mode       = 'auto', -- 'auto' | 'native' | 'react' | 'off' — /tools
+  ui_mode         = 'terminal', -- 'terminal' | 'native'
+  terminal_command = 'opencode',
   theme           = {},     -- user color overrides
 }
 
@@ -87,6 +89,8 @@ local function persist()
     show_timestamps = user_config.show_timestamps,
     debug_mode      = user_config.debug_mode,
     tool_mode       = user_config.tool_mode,
+    ui_mode         = user_config.ui_mode,
+    terminal_command = user_config.terminal_command,
     theme           = user_config.theme,
   }
   -- Only persist non-default values
@@ -198,6 +202,23 @@ end
 --- Get tool mode: 'auto' | 'native' | 'react' | 'off'.
 function M.get_tool_mode()
   return user_config.tool_mode or default_config.tool_mode
+end
+
+function M.get_ui_mode()
+  return user_config.ui_mode or default_config.ui_mode
+end
+
+function M.set_ui_mode(mode)
+  if mode ~= 'terminal' and mode ~= 'native' then
+    mode = 'terminal'
+  end
+  user_config.ui_mode = mode
+  persist()
+  M.notify_listeners()
+end
+
+function M.get_terminal_command()
+  return user_config.terminal_command or default_config.terminal_command
 end
 
 function M.set_tool_mode(mode)
